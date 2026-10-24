@@ -24,10 +24,9 @@ source .env 2>/dev/null || true
 export VOXCPM_BRIDGE_PORT="${VOXCPM_BRIDGE_PORT:-10212}"
 export PROMPT_WAV="${PROMPT_WAV:-$DIR/voices/nicoleheart.wav}"
 export PROMPT_TEXT="${PROMPT_TEXT:-}"
-export VOICE_SEED="${VOICE_SEED:--1}"
+export VOICE_SEED="${VOICE_SEED:-42}"
 export VOICE_NAME="${VOICE_NAME:-nicoleheart}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-export CLONING_MODE="${CLONING_MODE:-}"
 
 # Initialize before sourcing so .env can extend it, and so the
 # unconditional expansion at the bottom is safe under `set -e`.
@@ -35,10 +34,10 @@ if ! declare -p EXTRA_ARGS &>/dev/null; then
     EXTRA_ARGS=()
 fi
 
-if [ -n "$CLONING_MODE" ]; then
-    EXTRA_ARGS+=("--cloning-mode" "$CLONING_MODE")
-    echo "    clone:   ${CLONING_MODE:-auto} (ultimate needs PROMPT_TEXT)"
-fi
+# CLONING_MODE: "ultimate" (needs PROMPT_TEXT, best timbre, no style/tags)
+#               "controllable" (reference only, style/tags work)
+# Default: auto (ultimate if PROMPT_TEXT set, else controllable)
+export CLONING_MODE="${CLONING_MODE:-}"
 
 BRIDGE_SCRIPT="${BRIDGE_SCRIPT:-$DIR/bridge_voxcpm2.py}"
 
@@ -78,7 +77,20 @@ if [ ! -f ".deps-stamp" ]; then
     TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
     uv pip install torch --index-url "$TORCH_INDEX"
 
-    uv pip install voxcpm wyoming soundfile
+    # CRITICAL: Install from GitHub main, NOT pypi.
+    # The seed parameter (required for voice consistency) was merged
+    # June 2026, after the last pypi release (2.0.3 in May 2026).
+    # Pin to a commit hash to avoid drift across reinstallations.
+    if [ -n "$VOXCPM_COMMIT_HASH" ]; then
+        echo ">>> Installing voxcpm from git @ ${VOXCPM_COMMIT_HASH:0:8}..."
+        uv pip install --upgrade "voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git@$VOXCPM_COMMIT_HASH"
+    else
+        echo ">>> WARNING: VOXCPM_COMMIT_HASH not set; installing from main HEAD."
+        echo "         Voice consistency depends on seed support, which exists in main"
+        echo "         but may regress if upstream rebases. Set VOXCPM_COMMIT_HASH in .env"
+        echo "         to pin to a specific commit for reproducible installs."
+        uv pip install --upgrade "voxcpm @ git+https://github.com/OpenBMB/VoxCPM.git"
+    fi
 
     touch .deps-stamp
 else
@@ -92,11 +104,11 @@ fi
 
 if [ "${PREDOWNLOAD_MODEL:-1}" = "1" ] && [ ! -f ".model-stamp" ]; then
     echo ">>> Pre-downloading model weights..."
-    python - <<'EOF'
+    python - <<EOF
 import logging
 logging.basicConfig(level=logging.INFO)
 from huggingface_hub import snapshot_download
-snapshot_download("${MODEL_ID:-openbmb/VoxCPM2}",
+snapshot_download("$MODEL_ID",
                   allow_patterns=["*.json", "*.safetensors", "*.txt"])
 print("model weights cached")
 EOF
@@ -120,28 +132,30 @@ if [ -z "$PROMPT_TEXT" ]; then
     echo "         Set PROMPT_TEXT to the exact transcript of the reference WAV." >&2
 fi
 
+# NOTE: With VOICE_SEED defaulting to 42, this warning shouldn't fire
 if [ "$VOICE_SEED" -lt 0 ]; then
     echo "WARNING: VOICE_SEED not set (< 0) — each block gets a random voice" >&2
     echo "         bias, causing inconsistent timbre between sentences." >&2
     echo "         Set VOICE_SEED (e.g. 42) in .env for a pinned voice." >&2
 fi
 
-# NEW: contradictory combo check (cosmetic — the bridge downgrades anyway)
+# NOTE: Contradictory combo check (cosmetic — the bridge downgrades anyway)
 if [ "${CLONING_MODE:-}" = "ultimate" ] && [ -z "$PROMPT_TEXT" ]; then
     echo "WARNING: CLONING_MODE=ultimate needs PROMPT_TEXT; the bridge will" >&2
     echo "         fall back to controllable mode." >&2
 fi
 
-# NEW: only pass the flag when set, so unset keeps auto-resolution
+# NOTE: Only pass the flag when set, so unset keeps auto-resolution
 if [ -n "${CLONING_MODE:-}" ]; then
     EXTRA_ARGS+=("--cloning-mode" "$CLONING_MODE")
 fi
 
 echo ">>> Starting Wyoming bridge on port $VOXCPM_BRIDGE_PORT"
 echo "    voice:   $VOICE_NAME ($PROMPT_WAV)"
-echo "    clone:   ${CLONING_MODE:-auto} (ultimate needs PROMPT_TEXT)"   # NEW
+echo "    clone:   ${CLONING_MODE:-auto} (ultimate needs PROMPT_TEXT)"
 echo "    seed:    $VOICE_SEED"
 echo "    GPU:     CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "    deps:    voxcpm @ ${VOXCPM_COMMIT_HASH:-git/main HEAD}"
 
 exec python "$BRIDGE_SCRIPT" \
     --uri "tcp://0.0.0.0:${VOXCPM_BRIDGE_PORT}" \
