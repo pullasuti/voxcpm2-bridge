@@ -6,6 +6,14 @@ carried over unchanged: sentence merging, prebuffering (jitter buffer),
 uniform re-chunking, Error events, graceful shutdown, bind-first /
 load-later startup. VoxCPM2-specific behavior:
 
+  * SOFT-VOICE STYLE VOCABULARY — every style instruction carries a
+    byte-identical identity clause (--voice-descriptor, default
+    "a soft, delicate, gentle voice") followed by a delivery clause.
+    Because the identity half of the conditioning never changes,
+    cross-block timbre drift shrinks AND the delivery vocabulary is
+    deliberately low-arousal (smiling, pleased, tender) instead of
+    high-arousal (excited, energetic), which fights the reference
+    timbre. Expressive range is preserved; loudness is not.
   * CLONING MODES — upstream, ultimate cloning (reference supplied via
     BOTH pathways: isolated reference + continuation prefix with its
     transcript) and style control are MUTUALLY EXCLUSIVE. In ultimate
@@ -23,21 +31,18 @@ load-later startup. VoxCPM2-specific behavior:
     otherwise. In ultimate mode the bridge SUPPRESSES style/tag
     instructions (with a logged warning) instead of letting the
     model read them aloud.
-
   * VOICE CONSISTENCY — three measures against timbre drift between
     blocks (each merged block is a separate generation call):
-      1. FIXED SEED — official examples seed generation (seed=42).
-         --seed (default 42) pins it.
-      2. SIGNATURE-AWARE KWARGS — the public docs advertise
-         `seed=` on model.generate(), but generate_streaming()
-         forwards to the private _generate(), and not every released
-         build accepts it there (TypeError). At load time the bridge
-         introspects the signature, drops unsupported kwargs with a
-         warning, and — when there is no `seed` parameter — pins the
-         global RNGs (random, numpy, torch, CUDA) before each block
-         instead, which stabilizes the diffusion sampler's draws.
-      3. ULTIMATE CLONING — as described above (highest-SIM cloning
-         recipe per the technical report, at the cost of style tags).
+      1. FIXED SEED — requires the git build of voxcpm (pypi 2.0.3
+         predates the June 2026 seed merge, PR #327). The bridge
+         verifies via signature introspection; falls back to global
+         RNG reseeding (random, numpy, torch, CUDA) on older builds.
+      2. CONSTANT IDENTITY CLAUSE — the descriptor in every style
+         instruction is identical, so the identity half of the
+         conditioning is stable across blocks.
+      3. ULTIMATE CLONING — dual-pathway reference (highest-SIM
+         cloning recipe per the technical report, at the cost of
+         style tags).
   * TRUE STREAMING — each model yield is forwarded to the play queue
     the moment it is produced (run_coroutine_threadsafe from the GPU
     thread), so audio flows to HA progressively within a block.
@@ -46,30 +51,27 @@ load-later startup. VoxCPM2-specific behavior:
     than on HA's first real request. Non-fatal if it fails (the
     compile cost then lands on the first real request instead).
   * STYLE CONTROL (controllable mode only) — parenthetical
-    instruction prefix on the text, e.g.
-    "(speaking with a happy, excited tone) I got the job!"
-    The reference clip fixes the timbre; the parenthetical steers the
-    delivery. Sentence tags from the LLM map into this prefix.
+    instruction prefix on the text; sentence tags from the LLM map
+    into this prefix. Inline tags likewise controllable-mode only.
   * INLINE NON-VERBAL TAGS (controllable mode only) — VoxCPM2's own
     vocabulary, inserted in square brackets per the usage docs:
         [laughing] [sigh] [cough] [Uhm] [Shh]
         [Question-ah/-ei/-en/-oh] [Surprise-wa/-yo] [Dissatisfaction-hnn]
-    Tags use lowercase, used sparingly. CosyVoice-era tags are
-    aliased where an equivalent exists ([laughter] -> [laughing]);
-    tags with no equivalent ([noise], [lipsmack], [mn]) are dropped
-    with a warning rather than fed to the model.
+    CosyVoice-era tags are aliased where an equivalent exists;
+    tags with no equivalent are dropped with a warning rather than
+    fed to the model.
   * 48 kHz OUTPUT, 16 kHz REFERENCE INPUT — reference resampled once
     at startup (polyphase filter if scipy is available, linear
     interpolation otherwise).
 
 Known upstream limitations (worth remembering): the docs themselves
-note that cloning/style results vary between runs and recommend
-generating 1-3 times for the desired output; a fixed seed mitigates
-but does not fully eliminate drift. For production-grade consistency
-upstream recommends LoRA fine-tuning on 5-10 minutes of clean audio.
+note that cloning/style results vary between runs; a fixed seed and
+constant identity clause mitigate but do not fully eliminate drift.
+For production-grade consistency upstream recommends LoRA fine-tuning
+on 5-10 minutes of clean audio.
 
 Must run inside a venv with `pip install voxcpm wyoming soundfile`
-(Python >= 3.10, < 3.13; PyTorch >= 2.5).
+(Python >= 3.10, < 3.13; PyTorch >= 2.5; voxcpm from git for seed).
 """
 
 from __future__ import annotations
@@ -111,31 +113,83 @@ _LOGGER = logging.getLogger(__name__)
 WORDS_PER_SECOND = 2.8
 
 # ---------------------------------------------------------------------------
-# Tag handling
+# Soft-voice style vocabulary
 #
-#   STYLE tags  -> parenthetical style prefix on the text (STYLE_TAGS);
-#                  sticky for the rest of the utterance.
-#   INLINE tags -> passed through into the text in VoxCPM2's own
-#                  vocabulary (INLINE_TAGS + INTERACTION_TAGS).
+# Every instruction = BASE_VOICE (identity, never varies) + delivery
+# clause (varies by tag). Two reasons:
+#   1. Delivery vocabulary is deliberately LOW-AROUSAL: high-arousal
+#      words (excited, energetic, loud) fight a soft, delicate
+#      reference and cause timbre drift; low-arousal words (smiling,
+#      pleased, tender) preserve the voice while coloring emotion.
+#   2. The identity clause is byte-identical across all tags, so the
+#      identity half of the conditioning is stable across blocks —
+#      less re-negotiation of "who is speaking" per block.
 #
-# NOTE: both are CONTROLLABLE-MODE only. In ultimate (Hi-Fi) cloning
-# mode, upstream ignores the control prefix and may read it aloud,
-# and inline tags are suppressed — so the engine drops them instead.
+# Structurally incompatible tags (loud, angry-at-volume) are remapped
+# to low-arousal equivalents; there is no wording that makes a
+# delicate voice genuinely loud without abandoning the clone.
 # ---------------------------------------------------------------------------
 
-STYLE_TAGS = {
-    "warm": "speaking in a warm and friendly voice",
-    "confident": "speaking with a confident and steady voice",
-    "happy": "speaking with a happy and excited tone",
-    "sad": "speaking with a sad and melancholic tone",
-    "angry": "speaking with an angry tone",
-    "excited": "speaking with an excited and energetic tone",
-    "whisper": "speaking in a very soft whisper",
-    "serious": "speaking in a serious and calm manner",
-    "loud": "speaking as loudly as possible",
-    "slow": "speaking slowly",
-    "fast": "speaking quickly",
+DEFAULT_BASE_VOICE = "a soft, delicate, gentle voice"
+
+# Static, reference-ready compositions using the default descriptor.
+# The engine rebuilds this table at load time when --voice-descriptor
+# overrides the default, so .env tuning needs no code changes.
+_DELIVERY_CLAUSES = {
+    "warm":      "speaking warmly and kindly",
+    "sad":       "speaking sadly and wistfully",
+    "serious":   "speaking calmly and evenly",
+    "confident": "speaking quietly assured",
+    "happy":     "smiling warmly as she speaks",
+    "excited":   "pleased and delighted, lightly animated",
+    "playful":   "speaking playfully and amused",
+    "tender":    "speaking tenderly and affectionately",
+    "whisper":   "whispering barely above breath",
+    "thoughtful": "speaking thoughtfully and unhurried",
+    "slow":      "speaking slowly and unhurried",
+    "fast":      "speaking a little quicker, still relaxed",
 }
+
+# Legacy high-arousal tags from the LLM remapped to low-arousal
+# delivery clauses so old prompts keep working (and stop drifting).
+_TAG_FALLBACKS = {
+    "loud": "raising her voice slightly, still gentle",
+    "angry": "quietly annoyed and firm",
+}
+
+STYLE_TAG_ALIASES = {
+    "friendly": "warm",
+    "gentle": "tender",
+    "cheerful": "happy",
+    "calm": "serious",
+    "excitedly": "excited",
+    "happily": "happy",
+    "sadly": "sad",
+    "angrily": "angry",
+    "softly": "whisper",
+    "quieter": "whisper",
+}
+
+STYLE_ORDER = [
+    "warm", "happy", "sad", "serious", "confident", "excited",
+    "playful", "tender", "whisper", "thoughtful", "slow", "fast",
+]
+
+
+def build_style_tags(base_voice: str) -> dict[str, str]:
+    """Compose the full tag table: identity clause + delivery clause."""
+    tags = {
+        key: f"{base_voice}, {clause}"
+        for key, clause in _DELIVERY_CLAUSES.items()
+    }
+    for key, clause in _TAG_FALLBACKS.items():
+        tags[key] = f"{base_voice}, {clause}"
+    return tags
+
+
+# ---------------------------------------------------------------------------
+# Inline tag handling (controllable mode only)
+# ---------------------------------------------------------------------------
 
 INLINE_TAGS = {"laughing", "sigh", "cough"}
 
@@ -146,8 +200,6 @@ INTERACTION_TAGS = {
     "dissatisfaction-hnn",
 }
 
-# CosyVoice-era tag -> VoxCPM2-native equivalent. Anything not mapped
-# here and not in the native vocab is DROPPED with a warning.
 TAG_ALIASES = {
     "laughter": "laughing",
     "laughs": "laughing",
@@ -157,11 +209,10 @@ TAG_ALIASES = {
     "sigh": "sigh",
     "coughs": "cough",
     "cough": "cough",
-    "breath": "sigh",       # closest documented equivalent
+    "breath": "sigh",
     "breaths": "sigh",
     "um": "uhm",
     "hm": "uhm",
-    # no VoxCPM2 equivalent -> dropped: noise, lipsmack, mn
 }
 
 TAG_RE = re.compile(r"\s*[\[\{]([^\]\}]+)[\]\}]")
@@ -176,18 +227,19 @@ _ABBREVIATIONS = {
 
 
 def parse_tags(
-    text: str, allow_inline: bool = True
+    text: str,
+    style_tags: dict[str, str],
+    allow_inline: bool = True,
 ) -> tuple[str, Optional[str]]:
-    """Split text into (spoken text, style body or None).
+    """Split text into (spoken text, style instruction or None).
 
     Square-bracket tags whose canonical form is a style keyword become
     the (sticky) style instruction; those with an inline equivalent are
     passed through in VoxCPM2's vocabulary; anything else is dropped
     with a warning.
 
-    When allow_inline is False (ultimate/HF cloning mode, where
-    upstream suppresses tags), inline tags are stripped from the text
-    entirely rather than passed through.
+    When allow_inline is False (ultimate cloning mode, where upstream
+    suppresses tags), inline tags are stripped from the text entirely.
     """
     tags: list[str] = []
     out: list[str] = []
@@ -199,19 +251,18 @@ def parse_tags(
             out.append(text[pos:m.start()])
 
         key = tag.lower()
-        folded = TAG_ALIASES.get(key, key)
+        folded_style = STYLE_TAG_ALIASES.get(key, key)
+        folded_inline = TAG_ALIASES.get(key, key)
 
-        if folded in INLINE_TAGS or folded in INTERACTION_TAGS:
+        if folded_inline in INLINE_TAGS or folded_inline in INTERACTION_TAGS:
             if allow_inline:
-                out.append(f"[{folded}]")
+                out.append(f"[{folded_inline}]")
             else:
                 _LOGGER.info("stripping inline tag %r (ultimate mode)", tag)
-        elif folded in STYLE_TAGS:
-            tags.append(STYLE_TAGS[folded])
-        elif key in STYLE_TAGS:
-            tags.append(STYLE_TAGS[key])
+        elif folded_style in style_tags:
+            tags.append(style_tags[folded_style])
         else:
-            _LOGGER.warning("dropping tag %r (no VoxCPM2 equivalent)", tag)
+            _LOGGER.warning("dropping tag %r (no equivalent)", tag)
 
         pos = m.end()
 
@@ -305,6 +356,7 @@ class SynthEngine:
         prompt_wav: str,
         prompt_text: str,
         cloning_mode: str,
+        voice_descriptor: str,
         default_style: Optional[str],
         speed: float,
         cfg_value: float,
@@ -321,6 +373,9 @@ class SynthEngine:
         self.inference_timesteps = inference_timesteps
         self.seed = seed
 
+        # Soft-voice style table, composed from the descriptor.
+        self.style_tags = build_style_tags(voice_descriptor)
+
         self.model: Any = None
         self.reference_wav: Optional[str] = None
         self.sample_rate: int = 48000
@@ -332,9 +387,6 @@ class SynthEngine:
         self._warned_style_suppressed = False
 
         # Populated by _introspect_signature() at load time.
-        #   _accepted is None  -> signature unknown / accepts anything,
-        #                         so kwargs are passed unfiltered.
-        #   _accepted is a set -> only these names may be passed.
         self._accepted: Optional[set[str]] = None
         self._uses_seed_param = False
 
@@ -343,10 +395,9 @@ class SynthEngine:
     def _introspect_signature(self) -> None:
         """Work out which kwargs the installed voxcpm build accepts.
 
-        The docs advertise `seed=` on model.generate(), but
-        generate_streaming() forwards to the private _generate(), and
-        some released builds don't accept it there — passing it raises
-        TypeError. Rather than guess, inspect the real signature.
+        Seed support requires the git build (pypi 2.0.3 predates the
+        June 2026 merge); introspection lets the bridge adapt to
+        whichever is installed.
         """
         fn = getattr(self.model, "_generate", None)
         if fn is None:
@@ -360,7 +411,6 @@ class SynthEngine:
             return
 
         if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            # Takes **kwargs: nothing to filter against.
             self._accepted = None
             self._uses_seed_param = True
             _LOGGER.info("voxcpm _generate accepts **kwargs (no filtering)")
@@ -379,16 +429,15 @@ class SynthEngine:
         if not self._uses_seed_param:
             _LOGGER.warning(
                 "installed voxcpm has no `seed` parameter — falling back to "
-                "global RNG seeding for voice consistency"
+                "global RNG seeding for voice consistency. Install the git "
+                "build for true seed pinning (pypi 2.0.3 predates it)."
             )
 
     # -- seeding -------------------------------------------------------------
 
     def _seed_rngs(self) -> None:
-        """Version-independent consistency fallback: reseed the global
-        RNGs before each block so the diffusion sampler draws the same
-        random numbers every time. Used only when the model exposes no
-        `seed` parameter of its own."""
+        """Fallback: reseed the global RNGs before each block. Used only
+        when the model exposes no `seed` parameter of its own."""
         if self.seed < 0:
             return
         random.seed(self.seed)
@@ -414,7 +463,6 @@ class SynthEngine:
         self.reference_wav = ensure_reference_16k(self.prompt_wav)
         self._introspect_signature()
 
-        # Resolve the effective mode.
         if self._effective_mode == "ultimate":
             if self.prompt_text:
                 _LOGGER.info(
@@ -438,6 +486,12 @@ class SynthEngine:
             )
 
         _LOGGER.info(
+            "style vocabulary: identity clause %r shared by %d tags "
+            "(low-arousal delivery)",
+            self.style_tags["warm"].split(",")[0], len(self.style_tags),
+        )
+
+        _LOGGER.info(
             "model ready in %.1fs (sample_rate=%d, reference=%s)",
             time.monotonic() - t0, self.sample_rate, self.reference_wav,
         )
@@ -451,11 +505,8 @@ class SynthEngine:
             for out in self._generate(
                 "Warm up.", "speaking with a neutral tone"
             ):
-                # Drain; we only care that the kernels get built.
                 _ = to_pcm16(out)
         except Exception:
-            # A failed warm-up is not fatal — the first real request
-            # will just pay the compile cost instead.
             _LOGGER.warning(
                 "warm-up synthesis failed — torch.compile cost will land "
                 "on the first real request instead",
@@ -487,8 +538,6 @@ class SynthEngine:
         ultimate = self._effective_mode == "ultimate"
 
         if style and ultimate:
-            # Upstream ignores the control prefix in Hi-Fi cloning and
-            # may read it aloud — drop it (loudly, once) instead.
             if not self._warned_style_suppressed:
                 _LOGGER.warning(
                     "style instruction %r suppressed: ultimate cloning "
@@ -513,11 +562,6 @@ class SynthEngine:
         if self.reference_wav:
             kwargs["reference_wav_path"] = self.reference_wav
             if ultimate:
-                # Ultimate cloning: supply the reference through BOTH
-                # pathways — isolated reference AND continuation
-                # prefix with its transcript. Per the technical report
-                # this is the highest-similarity cloning recipe, at the
-                # documented cost of ignoring style control.
                 kwargs["prompt_wav_path"] = self.reference_wav
                 kwargs["prompt_text"] = self.prompt_text
 
@@ -525,12 +569,8 @@ class SynthEngine:
             if self._uses_seed_param:
                 kwargs["seed"] = self.seed
             else:
-                # No seed kwarg in this build — pin the global RNGs so
-                # every block draws identical randomness.
                 self._seed_rngs()
 
-        # Drop anything this build's signature doesn't accept, so a
-        # version mismatch degrades gracefully instead of raising.
         if self._accepted is not None:
             for key in [k for k in kwargs if k not in self._accepted]:
                 _LOGGER.warning(
@@ -676,14 +716,15 @@ class BridgeHandler(AsyncEventHandler):
             await self._play_q.put(item)
 
         def on_chunk(pcm: bytes) -> None:
-            # Called from the GPU thread; bounce onto the event loop.
             asyncio.run_coroutine_threadsafe(
                 _put((pcm, self.engine.sample_rate)), loop
             ).result()
 
         while (text := await self._work_q.get()) is not None:
             clean, style = parse_tags(
-                text, allow_inline=self.engine.allow_inline_tags
+                text,
+                style_tags=self.engine.style_tags,
+                allow_inline=self.engine.allow_inline_tags,
             )
             if not clean:
                 continue
@@ -694,8 +735,6 @@ class BridgeHandler(AsyncEventHandler):
             _LOGGER.info("synthesizing: text=%r style=%r", clean[:60], self._instr)
 
             try:
-                # Streams: each model yield lands on the play queue
-                # the moment it is produced.
                 await asyncio.to_thread(
                     self.engine.synthesize_streaming, clean, self._instr, on_chunk
                 )
@@ -854,6 +893,12 @@ def parse_args() -> argparse.Namespace:
              "slightly less faithful clone (default without --prompt-text).",
     )
     p.add_argument(
+        "--voice-descriptor", default=DEFAULT_BASE_VOICE,
+        help="Identity clause shared by ALL style instructions. Constant "
+             "across blocks for timbre stability; tune per reference "
+             "voice, e.g. 'a soft, delicate, gentle voice'.",
+    )
+    p.add_argument(
         "--style",
         default=None,
         help="Baseline style parenthetical applied to every utterance "
@@ -868,8 +913,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--seed", type=int, default=42,
         help="Fixed generation seed for voice consistency across blocks. "
-             "Used as the model's `seed` kwarg when supported, otherwise "
-             "applied to the global RNGs (-1 = unseeded/random)",
+             "Requires the git build of voxcpm; falls back to global RNG "
+             "seeding on pypi 2.0.3 (-1 = unseeded/random)",
     )
     p.add_argument(
         "--min-merged-seconds", type=float, default=4.0,
@@ -891,7 +936,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-rate", type=int, default=48000, help="Fallback rate")
     args = p.parse_args()
 
-    # Resolve the default cloning mode: ultimate iff prompt-text given.
     if args.cloning_mode is None:
         args.cloning_mode = "ultimate" if args.prompt_text else "controllable"
     return args
@@ -909,6 +953,7 @@ async def main() -> None:
         prompt_wav=args.prompt_wav,
         prompt_text=args.prompt_text,
         cloning_mode=args.cloning_mode,
+        voice_descriptor=args.voice_descriptor,
         default_style=args.style,
         speed=args.speed,
         cfg_value=args.cfg_value,
