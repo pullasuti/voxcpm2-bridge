@@ -23,8 +23,16 @@ source .env 2>/dev/null || true
 
 export VOXCPM_BRIDGE_PORT="${VOXCPM_BRIDGE_PORT:-10212}"
 export PROMPT_WAV="${PROMPT_WAV:-$DIR/voices/nicoleheart.wav}"
+export PROMPT_TEXT="${PROMPT_TEXT:-}"
+export VOICE_SEED="${VOICE_SEED:--1}"
 export VOICE_NAME="${VOICE_NAME:-nicoleheart}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+# Initialize before sourcing so .env can extend it, and so the
+# unconditional expansion at the bottom is safe under `set -e`.
+if ! declare -p EXTRA_ARGS &>/dev/null; then
+    EXTRA_ARGS=()
+fi
 
 BRIDGE_SCRIPT="${BRIDGE_SCRIPT:-$DIR/bridge_voxcpm2.py}"
 
@@ -59,9 +67,9 @@ source .venv/bin/activate
 echo ">>> Installing/updating dependencies..."
 if [ ! -f ".deps-stamp" ]; then
     # PyTorch with CUDA — install first so voxcpm doesn't drag in a CPU
-    # build via an unpinned dependency. Adjust the cuXXX suffix to your
-    # driver (cu121/cu124/cu126); the default matches most current setups.
-    TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu132}"
+    # build via an unpinned dependency. IMPORTANT: cu132 wheels have no
+    # matching torchaudio build; use cu130 (works with 13.x drivers).
+    TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu130}"
     uv pip install torch --index-url "$TORCH_INDEX"
 
     uv pip install voxcpm wyoming soundfile
@@ -82,7 +90,7 @@ if [ "${PREDOWNLOAD_MODEL:-1}" = "1" ] && [ ! -f ".model-stamp" ]; then
 import logging
 logging.basicConfig(level=logging.INFO)
 from huggingface_hub import snapshot_download
-snapshot_download("openbmb/VoxCPM2",
+snapshot_download("${MODEL_ID:-openbmb/VoxCPM2}",
                   allow_patterns=["*.json", "*.safetensors", "*.txt"])
 print("model weights cached")
 EOF
@@ -100,13 +108,28 @@ if [ ! -f "$PROMPT_WAV" ]; then
     echo "         cloning will fall back to default voice unless --prompt-wav is fixed" >&2
 fi
 
+if [ -z "$PROMPT_TEXT" ]; then
+    echo "WARNING: PROMPT_TEXT is not set — ultimate cloning disabled." >&2
+    echo "         Expect audible voice drift between sentence blocks." >&2
+    echo "         Set PROMPT_TEXT to the exact transcript of the reference WAV." >&2
+fi
+
+if [ "$VOICE_SEED" -lt 0 ]; then
+    echo "WARNING: VOICE_SEED not set (< 0) — each block gets a random voice" >&2
+    echo "         bias, causing inconsistent timbre between sentences." >&2
+    echo "         Set VOICE_SEED (e.g. 42) in .env for a pinned voice." >&2
+fi
+
 echo ">>> Starting Wyoming bridge on port $VOXCPM_BRIDGE_PORT"
 echo "    voice:   $VOICE_NAME ($PROMPT_WAV)"
+echo "    seed:    $VOICE_SEED"
 echo "    GPU:     CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
 exec python "$BRIDGE_SCRIPT" \
     --uri "tcp://0.0.0.0:${VOXCPM_BRIDGE_PORT}" \
     --model-id "${MODEL_ID:-openbmb/VoxCPM2}" \
     --prompt-wav "$PROMPT_WAV" \
+    --prompt-text "$PROMPT_TEXT" \
+    --seed "$VOICE_SEED" \
     --voice "$VOICE_NAME" \
     "${EXTRA_ARGS[@]}"
