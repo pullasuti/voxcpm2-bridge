@@ -6,12 +6,20 @@ carried over unchanged: sentence merging, prebuffering (jitter buffer),
 uniform re-chunking, Error events, graceful shutdown, bind-first /
 load-later startup. VoxCPM2-specific behavior:
 
-  * VOICE CONSISTENCY — two measures against timbre drift between
-    blocks:
+  * VOICE CONSISTENCY — three measures against timbre drift between
+    blocks (each merged block is a separate generation call):
       1. FIXED SEED — official examples seed generation (seed=42);
          unseeded runs draw a new random voice bias each call.
-         --seed (default 42) pins it. Use --seed -1 for random.
-      2. ULTIMATE CLONING — when --prompt-text (the reference clip's
+         --seed (default 42) pins it.
+      2. SIGNATURE-AWARE KWARGS — the public docs advertise
+         `seed=` on model.generate(), but generate_streaming()
+         forwards to the private _generate(), and not every released
+         build accepts it there (TypeError). At load time the bridge
+         introspects the signature, drops unsupported kwargs with a
+         warning, and — when there is no `seed` parameter — pins the
+         global RNGs (random/numpy/torch/CUDA) before each block
+         instead, which stabilizes the diffusion sampler's draws.
+      3. ULTIMATE CLONING — when --prompt-text (the reference clip's
          transcript) is provided, the reference is supplied through
          BOTH pathways (isolated reference + continuation prefix),
          which the technical report identifies as the highest-SIM
@@ -21,7 +29,8 @@ load-later startup. VoxCPM2-specific behavior:
     thread), so audio flows to HA progressively within a block.
   * STARTUP WARM-UP — a short dummy synthesis runs after model load
     so torch.compile's one-time cost is paid during startup rather
-    than on HA's first real request.
+    than on HA's first real request. Non-fatal if it fails (the
+    compile cost then lands on the first real request instead).
   * STYLE CONTROL — parenthetical instruction prefix on the text;
     sentence tags from the LLM map into this prefix.
   * INLINE NON-VERBAL TAGS — VoxCPM2's own vocabulary:
@@ -48,8 +57,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import logging
 import os
+import random
 import re
 import signal
 import sys
@@ -284,6 +295,78 @@ class SynthEngine:
         self.sample_rate: int = 48000
         self._lock = threading.Lock()
 
+        # Populated by _introspect_signature() at load time.
+        #   _accepted is None  -> signature unknown / accepts anything,
+        #                         so kwargs are passed unfiltered.
+        #   _accepted is a set -> only these names may be passed.
+        self._accepted: Optional[set[str]] = None
+        self._uses_seed_param = False
+
+    # -- capability discovery ------------------------------------------------
+
+    def _introspect_signature(self) -> None:
+        """Work out which kwargs the installed voxcpm build accepts.
+
+        The docs advertise `seed=` on model.generate(), but
+        generate_streaming() forwards to the private _generate(), and
+        some released builds don't accept it there — passing it raises
+        TypeError. Rather than guess, inspect the real signature.
+        """
+        fn = getattr(self.model, "_generate", None)
+        if fn is None:
+            fn = getattr(self.model, "generate_streaming", None)
+        if fn is None:
+            return
+
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return
+
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            # Takes **kwargs: nothing to filter against.
+            self._accepted = None
+            self._uses_seed_param = True
+            _LOGGER.info("voxcpm _generate accepts **kwargs (no filtering)")
+            return
+
+        self._accepted = {
+            name
+            for name, p in params.items()
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        }
+        self._uses_seed_param = "seed" in self._accepted
+        _LOGGER.info(
+            "voxcpm _generate accepts: %s",
+            ", ".join(sorted(self._accepted)) or "(nothing)",
+        )
+        if not self._uses_seed_param:
+            _LOGGER.warning(
+                "installed voxcpm has no `seed` parameter — falling back to "
+                "global RNG seeding for voice consistency"
+            )
+
+    # -- seeding -------------------------------------------------------------
+
+    def _seed_rngs(self) -> None:
+        """Version-independent consistency fallback: reseed the global
+        RNGs before each block so the diffusion sampler draws the same
+        random numbers every time. Used only when the model exposes no
+        `seed` parameter of its own."""
+        if self.seed < 0:
+            return
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        try:
+            import torch  # noqa: PLC0415
+            torch.manual_seed(self.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.seed)
+        except Exception:  # pragma: no cover - torch is always present
+            _LOGGER.warning("torch RNG seeding failed", exc_info=True)
+
+    # -- lifecycle -----------------------------------------------------------
+
     def load(self) -> None:
         from voxcpm import VoxCPM  # noqa: PLC0415
 
@@ -293,6 +376,7 @@ class SynthEngine:
         self.model = VoxCPM.from_pretrained(self.model_id, load_denoiser=False)
         self.sample_rate = int(self.model.tts_model.sample_rate)
         self.reference_wav = ensure_reference_16k(self.prompt_wav)
+        self._introspect_signature()
 
         if self.prompt_text:
             _LOGGER.info(
@@ -319,9 +403,15 @@ class SynthEngine:
         except Exception:
             # A failed warm-up is not fatal — the first real request
             # will just pay the compile cost instead.
-            _LOGGER.warning("warm-up synthesis failed", exc_info=True)
+            _LOGGER.warning(
+                "warm-up synthesis failed — torch.compile cost will land "
+                "on the first real request instead",
+                exc_info=True,
+            )
             return
         _LOGGER.info("warm-up complete in %.1fs", time.monotonic() - t0)
+
+    # -- generation ----------------------------------------------------------
 
     def _styled_text(self, text: str, style: Optional[str]) -> str:
         """Apply VoxCPM2 style control: parenthetical prefix on text."""
@@ -342,10 +432,7 @@ class SynthEngine:
             "cfg_value": self.cfg_value,
             "inference_timesteps": self.inference_timesteps,
         }
-        if self.seed >= 0:
-            # Fixed seed: the SAME random draw per request keeps the
-            # voice bias stable across blocks. (-1 = leave unseeded.)
-            kwargs["seed"] = self.seed
+
         if self.reference_wav:
             kwargs["reference_wav_path"] = self.reference_wav
             if self.prompt_text:
@@ -355,6 +442,24 @@ class SynthEngine:
                 # this is the highest-similarity cloning recipe.
                 kwargs["prompt_wav_path"] = self.reference_wav
                 kwargs["prompt_text"] = self.prompt_text
+
+        if self.seed >= 0:
+            if self._uses_seed_param:
+                kwargs["seed"] = self.seed
+            else:
+                # No seed kwarg in this build — pin the global RNGs so
+                # every block draws identical randomness.
+                self._seed_rngs()
+
+        # Drop anything this build's signature doesn't accept, so a
+        # version mismatch degrades gracefully instead of raising.
+        if self._accepted is not None:
+            for key in [k for k in kwargs if k not in self._accepted]:
+                _LOGGER.warning(
+                    "installed voxcpm does not accept %r — dropping "
+                    "(feature degraded)", key,
+                )
+                kwargs.pop(key)
 
         return self.model.generate_streaming(**kwargs)
 
@@ -672,8 +777,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--seed", type=int, default=42,
-        help="Fixed generation seed for voice consistency across blocks "
-             "(-1 = unseeded/random per request)",
+        help="Fixed generation seed for voice consistency across blocks. "
+             "Used as the model's `seed` kwarg when supported, otherwise "
+             "applied to the global RNGs (-1 = unseeded/random)",
     )
     p.add_argument(
         "--min-merged-seconds", type=float, default=4.0,
