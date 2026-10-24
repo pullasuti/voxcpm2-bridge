@@ -6,30 +6,39 @@ carried over unchanged: sentence merging, prebuffering (jitter buffer),
 uniform re-chunking, Error events, graceful shutdown, bind-first /
 load-later startup. VoxCPM2-specific behavior:
 
-  * TRUE STREAMING — the fetch worker forwards each model yield to
-    the play queue the moment it is produced (via
-    run_coroutine_threadsafe from the GPU thread). Audio flows to HA
-    progressively within a block, not batch-at-end.
+  * VOICE CONSISTENCY — two measures against timbre drift between
+    blocks:
+      1. FIXED SEED — official examples seed generation (seed=42);
+         unseeded runs draw a new random voice bias each call.
+         --seed (default 42) pins it. Use --seed -1 for random.
+      2. ULTIMATE CLONING — when --prompt-text (the reference clip's
+         transcript) is provided, the reference is supplied through
+         BOTH pathways (isolated reference + continuation prefix),
+         which the technical report identifies as the highest-SIM
+         cloning recipe.
+  * TRUE STREAMING — each model yield is forwarded to the play queue
+    the moment it is produced (run_coroutine_threadsafe from the GPU
+    thread), so audio flows to HA progressively within a block.
   * STARTUP WARM-UP — a short dummy synthesis runs after model load
-    so torch.compile's one-time cost (~50s on first request) is paid
-    during the startup window rather than on HA's first real request.
-  * STYLE CONTROL — VoxCPM2 steers expression with a parenthetical
-    instruction prefix on the text, e.g.
-    "(speaking with a happy, excited tone) I got the job!"
-    The reference clip fixes the timbre; the parenthetical steers the
-    delivery. Sentence tags from the LLM map into this prefix.
-  * INLINE NON-VERBAL TAGS — VoxCPM2's own vocabulary, inserted in
-    square brackets:
+    so torch.compile's one-time cost is paid during startup rather
+    than on HA's first real request.
+  * STYLE CONTROL — parenthetical instruction prefix on the text;
+    sentence tags from the LLM map into this prefix.
+  * INLINE NON-VERBAL TAGS — VoxCPM2's own vocabulary:
         [laughing] [sigh] [cough] [Uhm] [Shh]
         [Question-ah/-ei/-en/-oh] [Surprise-wa/-yo] [Dissatisfaction-hnn]
-    Docs recommend lowercase tags, used sparingly. CosyVoice-era tags
-    are aliased where an equivalent exists ([laughter] -> [laughing]);
-    tags with no equivalent ([breath], [noise], [lipsmack], [mn]) are
-    dropped with a warning rather than fed to the model.
-  * 48 kHz OUTPUT — sample rate is taken from the model; chunk sizes
-    derive from the actual rate (--samples-per-chunk 4096 ≈ 85 ms at
-    48 kHz).
-  * 16 kHz REFERENCE INPUT — resampled once at startup if needed.
+    CosyVoice-era tags are aliased where an equivalent exists;
+    unmatched tags ([noise], [lipsmack], [mn]) are dropped with a
+    warning rather than fed to the model.
+  * 48 kHz OUTPUT, 16 kHz REFERENCE INPUT — reference resampled once
+    at startup (polyphase filter if scipy is available, linear
+    interpolation otherwise).
+
+Known upstream limitation (worth remembering): the docs themselves
+note that cloning/style results vary between runs and recommend
+generating 1-3 times for the desired output; a fixed seed mitigates
+but does not fully eliminate drift. For production-grade consistency
+upstream recommends LoRA fine-tuning on 5-10 minutes of clean audio.
 
 Must run inside a venv with `pip install voxcpm wyoming soundfile`
 (Python >= 3.10, < 3.13; PyTorch >= 2.5).
@@ -202,6 +211,21 @@ def to_pcm16(data: Any) -> bytes:
     return (arr * 32767.0).astype("<i2").tobytes()
 
 
+def _resample(data: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
+    """Polyphase resampling when scipy is available (best quality),
+    linear-interpolation fallback otherwise."""
+    try:
+        from scipy.signal import resample_poly  # noqa: PLC0415
+        from math import gcd
+        g = gcd(sr, target_sr)
+        return resample_poly(data, target_sr // g, sr // g).astype(np.float32)
+    except ImportError:
+        duration = len(data) / sr
+        idx = np.linspace(0.0, duration, int(duration * target_sr), endpoint=False)
+        src_idx = np.arange(len(data)) / sr
+        return np.interp(idx, src_idx, data).astype(np.float32)
+
+
 def ensure_reference_16k(wav_path: str) -> str:
     """VoxCPM2 expects 16 kHz reference audio. Resample once if needed."""
     try:
@@ -221,10 +245,7 @@ def ensure_reference_16k(wav_path: str) -> str:
     if data.ndim > 1:
         data = data.mean(axis=1)
 
-    duration = len(data) / sr
-    idx = np.linspace(0.0, duration, int(duration * 16000), endpoint=False)
-    src_idx = np.arange(len(data)) / sr
-    resampled = np.interp(idx, src_idx, data).astype(np.float32)
+    resampled = _resample(data, sr, 16000)
 
     out = Path(tempfile.gettempdir()) / (
         Path(wav_path).stem + "_16k_reference.wav"
@@ -242,17 +263,21 @@ class SynthEngine:
         self,
         model_id: str,
         prompt_wav: str,
+        prompt_text: str,
         default_style: Optional[str],
         speed: float,
         cfg_value: float,
         inference_timesteps: int,
+        seed: int,
     ) -> None:
         self.model_id = model_id
         self.prompt_wav = prompt_wav
+        self.prompt_text = prompt_text
         self.default_style = default_style
         self.speed = speed
         self.cfg_value = cfg_value
         self.inference_timesteps = inference_timesteps
+        self.seed = seed
 
         self.model: Any = None
         self.reference_wav: Optional[str] = None
@@ -268,6 +293,12 @@ class SynthEngine:
         self.model = VoxCPM.from_pretrained(self.model_id, load_denoiser=False)
         self.sample_rate = int(self.model.tts_model.sample_rate)
         self.reference_wav = ensure_reference_16k(self.prompt_wav)
+
+        if self.prompt_text:
+            _LOGGER.info(
+                "ultimate cloning enabled: reference supplied via both "
+                "pathways (reference + continuation)"
+            )
 
         _LOGGER.info(
             "model ready in %.1fs (sample_rate=%d, reference=%s)",
@@ -311,8 +342,19 @@ class SynthEngine:
             "cfg_value": self.cfg_value,
             "inference_timesteps": self.inference_timesteps,
         }
+        if self.seed >= 0:
+            # Fixed seed: the SAME random draw per request keeps the
+            # voice bias stable across blocks. (-1 = leave unseeded.)
+            kwargs["seed"] = self.seed
         if self.reference_wav:
             kwargs["reference_wav_path"] = self.reference_wav
+            if self.prompt_text:
+                # Ultimate cloning: supply the reference through BOTH
+                # pathways — isolated reference AND continuation
+                # prefix with its transcript. Per the technical report
+                # this is the highest-similarity cloning recipe.
+                kwargs["prompt_wav_path"] = self.reference_wav
+                kwargs["prompt_text"] = self.prompt_text
 
         return self.model.generate_streaming(**kwargs)
 
@@ -613,6 +655,11 @@ def parse_args() -> argparse.Namespace:
         help="Reference speaker WAV for cloning (resampled to 16 kHz if needed)",
     )
     p.add_argument(
+        "--prompt-text", default="",
+        help="EXACT transcript of the reference WAV. Enables ultimate "
+             "cloning (highest voice similarity). Strongly recommended.",
+    )
+    p.add_argument(
         "--style",
         default=None,
         help="Baseline style parenthetical applied to every utterance",
@@ -622,6 +669,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--inference-timesteps", type=int, default=10,
         help="Diffusion solver steps (higher = slower, often better)",
+    )
+    p.add_argument(
+        "--seed", type=int, default=42,
+        help="Fixed generation seed for voice consistency across blocks "
+             "(-1 = unseeded/random per request)",
     )
     p.add_argument(
         "--min-merged-seconds", type=float, default=4.0,
@@ -654,10 +706,12 @@ async def main() -> None:
     engine = SynthEngine(
         model_id=args.model_id,
         prompt_wav=args.prompt_wav,
+        prompt_text=args.prompt_text,
         default_style=args.style,
         speed=args.speed,
         cfg_value=args.cfg_value,
         inference_timesteps=args.inference_timesteps,
+        seed=args.seed,
     )
 
     ready = asyncio.Event()
