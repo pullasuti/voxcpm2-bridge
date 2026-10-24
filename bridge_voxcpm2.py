@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""VoxCPM2 Wyoming TTS bridge — direct variant (no HTTP).
+"""VoxCPM2 Wyoming TTS bridge — direct variant (no HTTP), streaming.
 
-Adapted from the CosyVoice direct bridge. The pipeline, sentence
-merging, prebuffering, uniform re-chunking, Error events and graceful
-shutdown are engine-agnostic and carried over unchanged; the engine
-adapter and the tag system are VoxCPM2-specific:
+Adapted from the CosyVoice direct bridge. Engine-agnostic machinery
+carried over unchanged: sentence merging, prebuffering (jitter buffer),
+uniform re-chunking, Error events, graceful shutdown, bind-first /
+load-later startup. VoxCPM2-specific behavior:
 
-  * STREAMING  — model.generate_streaming(text, reference_wav_path=...)
-    yields audio chunks as they are produced.
+  * TRUE STREAMING — the fetch worker forwards each model yield to
+    the play queue the moment it is produced (via
+    run_coroutine_threadsafe from the GPU thread). Audio flows to HA
+    progressively within a block, not batch-at-end.
+  * STARTUP WARM-UP — a short dummy synthesis runs after model load
+    so torch.compile's one-time cost (~50s on first request) is paid
+    during the startup window rather than on HA's first real request.
   * STYLE CONTROL — VoxCPM2 steers expression with a parenthetical
     instruction prefix on the text, e.g.
     "(speaking with a happy, excited tone) I got the job!"
@@ -21,12 +26,10 @@ adapter and the tag system are VoxCPM2-specific:
     are aliased where an equivalent exists ([laughter] -> [laughing]);
     tags with no equivalent ([breath], [noise], [lipsmack], [mn]) are
     dropped with a warning rather than fed to the model.
-  * 48 kHz OUTPUT — sample rate is taken from the model. Defaults are
-    scaled accordingly (chunk sizes are computed from the actual rate;
-    --samples-per-chunk default of 4096 ≈ 85 ms at 48 kHz).
-  * 16 kHz REFERENCE INPUT — VoxCPM2 expects 16 kHz reference audio.
-    If the prompt WAV is at another rate it is resampled once at
-    startup (numpy linear interpolation) into the cache dir.
+  * 48 kHz OUTPUT — sample rate is taken from the model; chunk sizes
+    derive from the actual rate (--samples-per-chunk 4096 ≈ 85 ms at
+    48 kHz).
+  * 16 kHz REFERENCE INPUT — resampled once at startup if needed.
 
 Must run inside a venv with `pip install voxcpm wyoming soundfile`
 (Python >= 3.10, < 3.13; PyTorch >= 2.5).
@@ -46,7 +49,7 @@ import threading
 import time
 from functools import partial
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import numpy as np
 
@@ -71,11 +74,8 @@ WORDS_PER_SECOND = 2.8
 # ---------------------------------------------------------------------------
 # Tag handling
 #
-# Two mechanisms, mirroring VoxCPM2's native control surfaces:
-#
-#   STYLE tags  -> parenthetical style prefix on the text (TAG_MAP);
-#                  sticky for the rest of the utterance, like the
-#                  CosyVoice bridge's instruction behavior.
+#   STYLE tags  -> parenthetical style prefix on the text (STYLE_TAGS);
+#                  sticky for the rest of the utterance.
 #   INLINE tags -> passed through into the text in VoxCPM2's own
 #                  vocabulary (INLINE_TAGS + INTERACTION_TAGS).
 #
@@ -97,8 +97,6 @@ STYLE_TAGS = {
     "fast": "speaking quickly",
 }
 
-# VoxCPM2 documented inline non-verbal tags (keep lowercase; the docs
-# recommend lowercase forms).
 INLINE_TAGS = {"laughing", "sigh", "cough"}
 
 INTERACTION_TAGS = {
@@ -109,8 +107,7 @@ INTERACTION_TAGS = {
 }
 
 # CosyVoice-era tag -> VoxCPM2-native equivalent. Anything not mapped
-# here and not in the native vocab is DROPPED with a warning (feeding
-# untrained tags to the model risks them being read aloud).
+# here and not in the native vocab is DROPPED with a warning.
 TAG_ALIASES = {
     "laughter": "laughing",
     "laughs": "laughing",
@@ -128,7 +125,6 @@ TAG_ALIASES = {
 }
 
 TAG_RE = re.compile(r"\s*[\[\{]([^\]\}]+)[\]\}]")
-PAREN_RE = re.compile(r"\(\s*([a-zA-Z\-]+)\s*\)")
 
 _TERM_RE = re.compile(r"[.!?…][\"'”’)\]]*\s+")
 _WORD_RE = re.compile(r"[A-Za-z.]+$")
@@ -137,18 +133,6 @@ _ABBREVIATIONS = {
     "e.g", "i.e", "eg", "ie", "etc", "mr", "mrs", "ms", "dr", "prof",
     "sr", "jr", "vs", "st",
 }
-
-
-def _canonical_tag(tag: str) -> Optional[str]:
-    """Map any incoming tag to a VoxCPM2-native inline tag, or None.
-
-    None means: not expressible inline — either a STYLE tag (handled
-    separately) or to be dropped.
-    """
-    key = tag.lower()
-    if key in INLINE_TAGS or key in INTERACTION_TAGS:
-        return key
-    return TAG_ALIASES.get(key)
 
 
 def parse_tags(text: str) -> tuple[str, Optional[str]]:
@@ -163,27 +147,19 @@ def parse_tags(text: str) -> tuple[str, Optional[str]]:
     out: list[str] = []
     pos = 0
 
-    def _scan(candidate: str) -> str:
-        """Recursively resolve alias chains ([laughter] -> [laughing])."""
-        c = _canonical_tag(candidate)
-        if c is not None and (c in INLINE_TAGS or c in INTERACTION_TAGS):
-            return c
-        return candidate
-
     for m in TAG_RE.finditer(text):
         tag = m.group(1).strip()
         if m.start() > pos:
             out.append(text[pos:m.start()])
 
         key = tag.lower()
-        # Alias-fold first, so [laughter] behaves like [laughing].
         folded = TAG_ALIASES.get(key, key)
 
         if folded in INLINE_TAGS or folded in INTERACTION_TAGS:
             out.append(f"[{folded}]")
         elif folded in STYLE_TAGS:
             tags.append(STYLE_TAGS[folded])
-        elif key in STYLE_TAGS:  # e.g. alias "confidence"
+        elif key in STYLE_TAGS:
             tags.append(STYLE_TAGS[key])
         else:
             _LOGGER.warning("dropping tag %r (no VoxCPM2 equivalent)", tag)
@@ -243,7 +219,7 @@ def ensure_reference_16k(wav_path: str) -> str:
 
     _LOGGER.info("resampling reference %s: %d Hz -> 16000 Hz", wav_path, sr)
     if data.ndim > 1:
-        data = data.mean(axis=1)  # reference input is mono
+        data = data.mean(axis=1)
 
     duration = len(data) / sr
     idx = np.linspace(0.0, duration, int(duration * 16000), endpoint=False)
@@ -272,7 +248,7 @@ class SynthEngine:
         inference_timesteps: int,
     ) -> None:
         self.model_id = model_id
-        self.prompt_wav = prompt_wav  # raw path; resampled in load()
+        self.prompt_wav = prompt_wav
         self.default_style = default_style
         self.speed = speed
         self.cfg_value = cfg_value
@@ -298,6 +274,24 @@ class SynthEngine:
             time.monotonic() - t0, self.sample_rate, self.reference_wav,
         )
 
+    def warm_up(self) -> None:
+        """Run one tiny synthesis so torch.compile pays its one-time
+        cost here, during startup, instead of on the first request."""
+        _LOGGER.info("warm-up synthesis (compiling kernels)...")
+        t0 = time.monotonic()
+        try:
+            for out in self._generate(
+                "Warm up.", "speaking with a neutral tone"
+            ):
+                # Drain; we only care that the kernels get built.
+                _ = to_pcm16(out)
+        except Exception:
+            # A failed warm-up is not fatal — the first real request
+            # will just pay the compile cost instead.
+            _LOGGER.warning("warm-up synthesis failed", exc_info=True)
+            return
+        _LOGGER.info("warm-up complete in %.1fs", time.monotonic() - t0)
+
     def _styled_text(self, text: str, style: Optional[str]) -> str:
         """Apply VoxCPM2 style control: parenthetical prefix on text."""
         parts = []
@@ -322,35 +316,38 @@ class SynthEngine:
 
         return self.model.generate_streaming(**kwargs)
 
-    def synthesize_chunks(
-        self, text: str, style: Optional[str]
-    ) -> list[tuple[bytes, int]]:
-        """Blocking. Returns [(pcm16 chunk, sample_rate), ...] one per
-        model yield so the play worker can forward them as produced."""
+    def synthesize_streaming(
+        self, text: str, style: Optional[str], on_chunk: Callable[[bytes], None]
+    ) -> None:
+        """Blocking (call from a worker thread). Invokes on_chunk(pcm)
+        for every model yield the moment it is produced, so audio
+        flows downstream progressively."""
         with self._lock:
-            chunks: list[tuple[bytes, int]] = []
             t0 = time.monotonic()
-            for i, out in enumerate(self._generate(text, style)):
-                if i == 0:
-                    _LOGGER.info(
-                        "[timing] first chunk: req +%.3fs",
-                        time.monotonic() - t0,
-                    )
+            n = 0
+            total = 0
+            for out in self._generate(text, style):
                 pcm = to_pcm16(out)
-                if pcm:
-                    chunks.append((pcm, self.sample_rate))
-            dur = sum(len(p) for p, _ in chunks) / (2 * self.sample_rate)
+                if not pcm:
+                    continue
+                n += 1
+                total += len(pcm)
+                if n == 1:
+                    _LOGGER.info(
+                        "[timing] first chunk: req +%.3fs", time.monotonic() - t0
+                    )
+                on_chunk(pcm)
+            dur = total / (2 * self.sample_rate)
             if dur > 0:
                 _LOGGER.info(
-                    "[timing] block done: %.2fs audio in %.2fs (rtf %.2f)",
-                    dur, time.monotonic() - t0,
+                    "[timing] block done: %d chunks, %.2fs audio in %.2fs (rtf %.2f)",
+                    n, dur, time.monotonic() - t0,
                     (time.monotonic() - t0) / dur,
                 )
-            return chunks
 
 
 # ---------------------------------------------------------------------------
-# Wyoming handler — carried over from the CosyVoice direct bridge
+# Wyoming handler
 # ---------------------------------------------------------------------------
 
 class BridgeHandler(AsyncEventHandler):
@@ -448,6 +445,17 @@ class BridgeHandler(AsyncEventHandler):
     async def _fetch_worker(self) -> None:
         await self._ready.wait()
 
+        loop = asyncio.get_running_loop()
+
+        async def _put(item: tuple[bytes, int]) -> None:
+            await self._play_q.put(item)
+
+        def on_chunk(pcm: bytes) -> None:
+            # Called from the GPU thread; bounce onto the event loop.
+            asyncio.run_coroutine_threadsafe(
+                _put((pcm, self.engine.sample_rate)), loop
+            ).result()
+
         while (text := await self._work_q.get()) is not None:
             clean, style = parse_tags(text)
             if not clean:
@@ -459,8 +467,10 @@ class BridgeHandler(AsyncEventHandler):
             _LOGGER.info("synthesizing: text=%r style=%r", clean[:60], self._instr)
 
             try:
-                chunks = await asyncio.to_thread(
-                    self.engine.synthesize_chunks, clean, self._instr
+                # Streams: each model yield lands on the play queue
+                # the moment it is produced.
+                await asyncio.to_thread(
+                    self.engine.synthesize_streaming, clean, self._instr, on_chunk
                 )
             except Exception as err:
                 _LOGGER.exception("block synthesis failed: %r", clean[:60])
@@ -474,10 +484,6 @@ class BridgeHandler(AsyncEventHandler):
                 except Exception:
                     pass  # connection may already be gone
                 continue
-
-            for audio, rate in chunks:
-                if audio:
-                    await self._play_q.put((audio, rate))
 
     async def _play_worker(self) -> None:
         """Jitter-buffer before AudioStart; write-through after; uniform
@@ -597,7 +603,7 @@ class BridgeHandler(AsyncEventHandler):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VoxCPM2 Wyoming bridge (direct)")
-    p.add_argument("--uri", default="tcp://0.0.0.0:10212", help="Wyoming server URI")
+    p.add_argument("--uri", default="tcp://0.0.0.0:10211", help="Wyoming server URI")
     p.add_argument(
         "--model-id", default="openbmb/VoxCPM2",
         help="HuggingFace model id (weights auto-download on first run)",
@@ -629,6 +635,10 @@ def parse_args() -> argparse.Namespace:
         "--samples-per-chunk", type=int, default=4096,
         help="AudioChunk size in samples (~85 ms at 48 kHz)",
     )
+    p.add_argument(
+        "--skip-warmup", action="store_true",
+        help="Do not run the startup warm-up synthesis",
+    )
     p.add_argument("--voice", default="nicoleheart", help="Voice name reported to HA")
     p.add_argument("--sample-rate", type=int, default=48000, help="Fallback rate")
     return p.parse_args()
@@ -655,6 +665,8 @@ async def main() -> None:
     async def _load_engine() -> None:
         try:
             await asyncio.to_thread(engine.load)
+            if not args.skip_warmup:
+                await asyncio.to_thread(engine.warm_up)
         except Exception:
             _LOGGER.critical("model load failed", exc_info=True)
             os._exit(1)
