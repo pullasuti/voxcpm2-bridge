@@ -6,10 +6,27 @@ carried over unchanged: sentence merging, prebuffering (jitter buffer),
 uniform re-chunking, Error events, graceful shutdown, bind-first /
 load-later startup. VoxCPM2-specific behavior:
 
+  * CLONING MODES — upstream, ultimate cloning (reference supplied via
+    BOTH pathways: isolated reference + continuation prefix with its
+    transcript) and style control are MUTUALLY EXCLUSIVE. In ultimate
+    ("Hi-Fi") mode, the control prefix in parentheses is ignored and
+    may be READ ALOUD as text, and inline non-verbal tags are
+    suppressed along with it. See ronger-x/voxcpm2-service PR #3:
+    "When Hi-Fi mode is enabled, the control instruction is ignored."
+
+      --cloning-mode ultimate      best timbre fidelity, NO style/tags
+                                   (requires --prompt-text)
+      --cloning-mode controllable  style parentheticals + inline tags
+                                   work; slightly less faithful clone
+
+    Default: ultimate when --prompt-text is given, controllable
+    otherwise. In ultimate mode the bridge SUPPRESSES style/tag
+    instructions (with a logged warning) instead of letting the
+    model read them aloud.
+
   * VOICE CONSISTENCY — three measures against timbre drift between
     blocks (each merged block is a separate generation call):
-      1. FIXED SEED — official examples seed generation (seed=42);
-         unseeded runs draw a new random voice bias each call.
+      1. FIXED SEED — official examples seed generation (seed=42).
          --seed (default 42) pins it.
       2. SIGNATURE-AWARE KWARGS — the public docs advertise
          `seed=` on model.generate(), but generate_streaming()
@@ -17,13 +34,10 @@ load-later startup. VoxCPM2-specific behavior:
          build accepts it there (TypeError). At load time the bridge
          introspects the signature, drops unsupported kwargs with a
          warning, and — when there is no `seed` parameter — pins the
-         global RNGs (random/numpy/torch/CUDA) before each block
+         global RNGs (random, numpy, torch, CUDA) before each block
          instead, which stabilizes the diffusion sampler's draws.
-      3. ULTIMATE CLONING — when --prompt-text (the reference clip's
-         transcript) is provided, the reference is supplied through
-         BOTH pathways (isolated reference + continuation prefix),
-         which the technical report identifies as the highest-SIM
-         cloning recipe.
+      3. ULTIMATE CLONING — as described above (highest-SIM cloning
+         recipe per the technical report, at the cost of style tags).
   * TRUE STREAMING — each model yield is forwarded to the play queue
     the moment it is produced (run_coroutine_threadsafe from the GPU
     thread), so audio flows to HA progressively within a block.
@@ -31,19 +45,24 @@ load-later startup. VoxCPM2-specific behavior:
     so torch.compile's one-time cost is paid during startup rather
     than on HA's first real request. Non-fatal if it fails (the
     compile cost then lands on the first real request instead).
-  * STYLE CONTROL — parenthetical instruction prefix on the text;
-    sentence tags from the LLM map into this prefix.
-  * INLINE NON-VERBAL TAGS — VoxCPM2's own vocabulary:
+  * STYLE CONTROL (controllable mode only) — parenthetical
+    instruction prefix on the text, e.g.
+    "(speaking with a happy, excited tone) I got the job!"
+    The reference clip fixes the timbre; the parenthetical steers the
+    delivery. Sentence tags from the LLM map into this prefix.
+  * INLINE NON-VERBAL TAGS (controllable mode only) — VoxCPM2's own
+    vocabulary, inserted in square brackets per the usage docs:
         [laughing] [sigh] [cough] [Uhm] [Shh]
         [Question-ah/-ei/-en/-oh] [Surprise-wa/-yo] [Dissatisfaction-hnn]
-    CosyVoice-era tags are aliased where an equivalent exists;
-    unmatched tags ([noise], [lipsmack], [mn]) are dropped with a
-    warning rather than fed to the model.
+    Tags use lowercase, used sparingly. CosyVoice-era tags are
+    aliased where an equivalent exists ([laughter] -> [laughing]);
+    tags with no equivalent ([noise], [lipsmack], [mn]) are dropped
+    with a warning rather than fed to the model.
   * 48 kHz OUTPUT, 16 kHz REFERENCE INPUT — reference resampled once
     at startup (polyphase filter if scipy is available, linear
     interpolation otherwise).
 
-Known upstream limitation (worth remembering): the docs themselves
+Known upstream limitations (worth remembering): the docs themselves
 note that cloning/style results vary between runs and recommend
 generating 1-3 times for the desired output; a fixed seed mitigates
 but does not fully eliminate drift. For production-grade consistency
@@ -99,8 +118,9 @@ WORDS_PER_SECOND = 2.8
 #   INLINE tags -> passed through into the text in VoxCPM2's own
 #                  vocabulary (INLINE_TAGS + INTERACTION_TAGS).
 #
-# ALIASES folds CosyVoice-era vocabulary into VoxCPM2's equivalents so
-# existing LLM prompts keep working.
+# NOTE: both are CONTROLLABLE-MODE only. In ultimate (Hi-Fi) cloning
+# mode, upstream ignores the control prefix and may read it aloud,
+# and inline tags are suppressed — so the engine drops them instead.
 # ---------------------------------------------------------------------------
 
 STYLE_TAGS = {
@@ -155,13 +175,19 @@ _ABBREVIATIONS = {
 }
 
 
-def parse_tags(text: str) -> tuple[str, Optional[str]]:
+def parse_tags(
+    text: str, allow_inline: bool = True
+) -> tuple[str, Optional[str]]:
     """Split text into (spoken text, style body or None).
 
     Square-bracket tags whose canonical form is a style keyword become
     the (sticky) style instruction; those with an inline equivalent are
     passed through in VoxCPM2's vocabulary; anything else is dropped
     with a warning.
+
+    When allow_inline is False (ultimate/HF cloning mode, where
+    upstream suppresses tags), inline tags are stripped from the text
+    entirely rather than passed through.
     """
     tags: list[str] = []
     out: list[str] = []
@@ -176,7 +202,10 @@ def parse_tags(text: str) -> tuple[str, Optional[str]]:
         folded = TAG_ALIASES.get(key, key)
 
         if folded in INLINE_TAGS or folded in INTERACTION_TAGS:
-            out.append(f"[{folded}]")
+            if allow_inline:
+                out.append(f"[{folded}]")
+            else:
+                _LOGGER.info("stripping inline tag %r (ultimate mode)", tag)
         elif folded in STYLE_TAGS:
             tags.append(STYLE_TAGS[folded])
         elif key in STYLE_TAGS:
@@ -275,6 +304,7 @@ class SynthEngine:
         model_id: str,
         prompt_wav: str,
         prompt_text: str,
+        cloning_mode: str,
         default_style: Optional[str],
         speed: float,
         cfg_value: float,
@@ -284,6 +314,7 @@ class SynthEngine:
         self.model_id = model_id
         self.prompt_wav = prompt_wav
         self.prompt_text = prompt_text
+        self.cloning_mode = cloning_mode  # "ultimate" | "controllable"
         self.default_style = default_style
         self.speed = speed
         self.cfg_value = cfg_value
@@ -294,6 +325,11 @@ class SynthEngine:
         self.reference_wav: Optional[str] = None
         self.sample_rate: int = 48000
         self._lock = threading.Lock()
+
+        # Effective mode after resolution (may downgrade to
+        # controllable if prompt_text is missing).
+        self._effective_mode = cloning_mode
+        self._warned_style_suppressed = False
 
         # Populated by _introspect_signature() at load time.
         #   _accepted is None  -> signature unknown / accepts anything,
@@ -378,10 +414,27 @@ class SynthEngine:
         self.reference_wav = ensure_reference_16k(self.prompt_wav)
         self._introspect_signature()
 
-        if self.prompt_text:
+        # Resolve the effective mode.
+        if self._effective_mode == "ultimate":
+            if self.prompt_text:
+                _LOGGER.info(
+                    "cloning mode: ULTIMATE (dual-pathway reference). "
+                    "NOTE: style instructions and inline tags are "
+                    "SUPPRESSED in this mode — upstream ignores the "
+                    "control prefix in Hi-Fi/transcript cloning and may "
+                    "read it aloud; we drop it instead."
+                )
+            else:
+                _LOGGER.warning(
+                    "--cloning-mode ultimate requires --prompt-text; "
+                    "falling back to controllable"
+                )
+                self._effective_mode = "controllable"
+        else:
             _LOGGER.info(
-                "ultimate cloning enabled: reference supplied via both "
-                "pathways (reference + continuation)"
+                "cloning mode: CONTROLLABLE (reference only). Style "
+                "parentheticals and inline tags are active; timbre "
+                "fidelity is slightly lower than ultimate mode."
             )
 
         _LOGGER.info(
@@ -426,20 +479,45 @@ class SynthEngine:
             return "(" + "; ".join(parts) + ") " + text
         return text
 
+    @property
+    def allow_inline_tags(self) -> bool:
+        return self._effective_mode == "controllable"
+
     def _generate(self, text: str, style: Optional[str]) -> Iterator[Any]:
+        ultimate = self._effective_mode == "ultimate"
+
+        if style and ultimate:
+            # Upstream ignores the control prefix in Hi-Fi cloning and
+            # may read it aloud — drop it (loudly, once) instead.
+            if not self._warned_style_suppressed:
+                _LOGGER.warning(
+                    "style instruction %r suppressed: ultimate cloning "
+                    "mode ignores control prefixes upstream (they would "
+                    "be read aloud). Switch to --cloning-mode "
+                    "controllable if you need style/emotion tags.",
+                    style[:60],
+                )
+                self._warned_style_suppressed = True
+            style = None
+        elif style and self.default_style and self.default_style not in style:
+            style = f"{style}; {self.default_style}"
+
+        text_out = text if (ultimate or not style) else self._styled_text(text, style)
+
         kwargs: dict[str, Any] = {
-            "text": self._styled_text(text, style),
+            "text": text_out,
             "cfg_value": self.cfg_value,
             "inference_timesteps": self.inference_timesteps,
         }
 
         if self.reference_wav:
             kwargs["reference_wav_path"] = self.reference_wav
-            if self.prompt_text:
+            if ultimate:
                 # Ultimate cloning: supply the reference through BOTH
                 # pathways — isolated reference AND continuation
                 # prefix with its transcript. Per the technical report
-                # this is the highest-similarity cloning recipe.
+                # this is the highest-similarity cloning recipe, at the
+                # documented cost of ignoring style control.
                 kwargs["prompt_wav_path"] = self.reference_wav
                 kwargs["prompt_text"] = self.prompt_text
 
@@ -604,7 +682,9 @@ class BridgeHandler(AsyncEventHandler):
             ).result()
 
         while (text := await self._work_q.get()) is not None:
-            clean, style = parse_tags(text)
+            clean, style = parse_tags(
+                text, allow_inline=self.engine.allow_inline_tags
+            )
             if not clean:
                 continue
 
@@ -762,12 +842,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--prompt-text", default="",
         help="EXACT transcript of the reference WAV. Enables ultimate "
-             "cloning (highest voice similarity). Strongly recommended.",
+             "cloning (highest voice similarity) — at the cost of style/"
+             "emotion control, which upstream ignores in that mode.",
+    )
+    p.add_argument(
+        "--cloning-mode", choices=("ultimate", "controllable"),
+        default=None,
+        help="ultimate: dual-pathway reference, best timbre, NO style/"
+             "tags (default when --prompt-text is set). controllable: "
+             "reference only, style parentheticals + inline tags work, "
+             "slightly less faithful clone (default without --prompt-text).",
     )
     p.add_argument(
         "--style",
         default=None,
-        help="Baseline style parenthetical applied to every utterance",
+        help="Baseline style parenthetical applied to every utterance "
+             "(controllable mode only)",
     )
     p.add_argument("--speed", type=float, default=1.0, help="1.0 = normal")
     p.add_argument("--cfg-value", type=float, default=2.0, help="Classifier-free guidance")
@@ -799,7 +889,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--voice", default="nicoleheart", help="Voice name reported to HA")
     p.add_argument("--sample-rate", type=int, default=48000, help="Fallback rate")
-    return p.parse_args()
+    args = p.parse_args()
+
+    # Resolve the default cloning mode: ultimate iff prompt-text given.
+    if args.cloning_mode is None:
+        args.cloning_mode = "ultimate" if args.prompt_text else "controllable"
+    return args
 
 
 async def main() -> None:
@@ -813,6 +908,7 @@ async def main() -> None:
         model_id=args.model_id,
         prompt_wav=args.prompt_wav,
         prompt_text=args.prompt_text,
+        cloning_mode=args.cloning_mode,
         default_style=args.style,
         speed=args.speed,
         cfg_value=args.cfg_value,

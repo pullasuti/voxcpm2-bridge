@@ -27,11 +27,17 @@ export PROMPT_TEXT="${PROMPT_TEXT:-}"
 export VOICE_SEED="${VOICE_SEED:--1}"
 export VOICE_NAME="${VOICE_NAME:-nicoleheart}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CLONING_MODE="${CLONING_MODE:-}"
 
 # Initialize before sourcing so .env can extend it, and so the
 # unconditional expansion at the bottom is safe under `set -e`.
 if ! declare -p EXTRA_ARGS &>/dev/null; then
     EXTRA_ARGS=()
+fi
+
+if [ -n "$CLONING_MODE" ]; then
+    EXTRA_ARGS+=("--cloning-mode" "$CLONING_MODE")
+    echo "    clone:   ${CLONING_MODE:-auto} (ultimate needs PROMPT_TEXT)"
 fi
 
 BRIDGE_SCRIPT="${BRIDGE_SCRIPT:-$DIR/bridge_voxcpm2.py}"
@@ -120,8 +126,20 @@ if [ "$VOICE_SEED" -lt 0 ]; then
     echo "         Set VOICE_SEED (e.g. 42) in .env for a pinned voice." >&2
 fi
 
+# NEW: contradictory combo check (cosmetic — the bridge downgrades anyway)
+if [ "${CLONING_MODE:-}" = "ultimate" ] && [ -z "$PROMPT_TEXT" ]; then
+    echo "WARNING: CLONING_MODE=ultimate needs PROMPT_TEXT; the bridge will" >&2
+    echo "         fall back to controllable mode." >&2
+fi
+
+# NEW: only pass the flag when set, so unset keeps auto-resolution
+if [ -n "${CLONING_MODE:-}" ]; then
+    EXTRA_ARGS+=("--cloning-mode" "$CLONING_MODE")
+fi
+
 echo ">>> Starting Wyoming bridge on port $VOXCPM_BRIDGE_PORT"
 echo "    voice:   $VOICE_NAME ($PROMPT_WAV)"
+echo "    clone:   ${CLONING_MODE:-auto} (ultimate needs PROMPT_TEXT)"   # NEW
 echo "    seed:    $VOICE_SEED"
 echo "    GPU:     CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
