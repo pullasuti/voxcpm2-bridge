@@ -55,9 +55,10 @@ load-later startup. VoxCPM2-specific behavior:
     into this prefix. Inline tags likewise controllable-mode only.
   * INLINE NON-VERBAL TAGS (controllable mode only) — VoxCPM2's own
     vocabulary, inserted in square brackets per the usage docs:
-        [laughing] [sigh] [cough] [Uhm] [Shh]
+        [laughing] [sigh] [Uhm] [Shh]
         [Question-ah/-ei/-en/-oh] [Surprise-wa/-yo] [Dissatisfaction-hnn]
-    CosyVoice-era tags are aliased where an equivalent exists;
+    (exact case matters; there is no [cough]). Other tags are aliased where
+    an equivalent exists;
     tags with no equivalent are dropped with a warning rather than
     fed to the model.
   * 48 kHz OUTPUT, 16 kHz REFERENCE INPUT — reference resampled once
@@ -111,6 +112,10 @@ _LOGGER = logging.getLogger(__name__)
 
 # Rough speech-rate estimate for merging decisions.
 WORDS_PER_SECOND = 2.8
+
+# A one-shot synthesize arriving this soon after synthesize-stop, with
+# matching text, is a late duplicate of the stream just played, not a request.
+LATE_DUPLICATE_WINDOW_S = 3.0
 
 # ---------------------------------------------------------------------------
 # Soft-voice style vocabulary
@@ -191,29 +196,38 @@ def build_style_tags(base_voice: str) -> dict[str, str]:
 # Inline tag handling (controllable mode only)
 # ---------------------------------------------------------------------------
 
-INLINE_TAGS = {"laughing", "sigh", "cough"}
-
-INTERACTION_TAGS = {
-    "uhm", "shh",
-    "question-ah", "question-ei", "question-en", "question-oh",
-    "surprise-wa", "surprise-yo",
-    "dissatisfaction-hnn",
+# VoxCPM2's documented non-verbal tags, in the EXACT case the model expects
+# (cookbook: voxcpm.readthedocs.io). Keys are lowercase lookups; values are
+# what is sent to the model. There is no [cough] (nor a breath tag): those
+# are dropped rather than sent, because unknown tags are spoken as words.
+CANON_INLINE = {
+    "laughing": "[laughing]",
+    "sigh": "[sigh]",
+    "uhm": "[Uhm]",
+    "shh": "[Shh]",
+    "question-ah": "[Question-ah]",
+    "question-ei": "[Question-ei]",
+    "question-en": "[Question-en]",
+    "question-oh": "[Question-oh]",
+    "surprise-wa": "[Surprise-wa]",
+    "surprise-yo": "[Surprise-yo]",
+    "dissatisfaction-hnn": "[Dissatisfaction-hnn]",
 }
 
 TAG_ALIASES = {
     "laughter": "laughing",
     "laughs": "laughing",
-    "laughing": "laughing",
     "laugh": "laughing",
     "sighs": "sigh",
-    "sigh": "sigh",
-    "coughs": "cough",
-    "cough": "cough",
-    "breath": "sigh",
-    "breaths": "sigh",
     "um": "uhm",
     "hm": "uhm",
+    "shush": "shh",
+    "hush": "shh",
 }
+
+# Known to have no VoxCPM2 equivalent: stripped quietly (one warning each).
+UNSUPPORTED_INLINE = {"cough", "coughs", "breath", "breaths", "breathing"}
+_warned_unsupported: set[str] = set()
 
 TAG_RE = re.compile(r"\s*[\[\{]([^\]\}]+)[\]\}]")
 
@@ -254,11 +268,17 @@ def parse_tags(
         folded_style = STYLE_TAG_ALIASES.get(key, key)
         folded_inline = TAG_ALIASES.get(key, key)
 
-        if folded_inline in INLINE_TAGS or folded_inline in INTERACTION_TAGS:
+        if folded_inline in CANON_INLINE:
             if allow_inline:
-                out.append(f"[{folded_inline}]")
+                # keep a space before the tag: the regex ate the one in front
+                out.append(f" {CANON_INLINE[folded_inline]} ")
             else:
                 _LOGGER.info("stripping inline tag %r (ultimate mode)", tag)
+        elif key in UNSUPPORTED_INLINE:
+            if key not in _warned_unsupported:
+                _warned_unsupported.add(key)
+                _LOGGER.warning(
+                    "tag %r has no VoxCPM2 equivalent; removing it", tag)
         elif folded_style in style_tags:
             tags.append(style_tags[folded_style])
         else:
@@ -270,6 +290,7 @@ def parse_tags(
         out.append(text[pos:])
 
     clean = " ".join("".join(out).split())
+    clean = re.sub(r"\s+([,.!?;:])", r"\1", clean)  # "[sigh] ," -> "[sigh],"
     return clean, ("; ".join(tags) if tags else None)
 
 
@@ -283,6 +304,15 @@ def speed_hint(speed: float) -> Optional[str]:
     if speed > 1.5:
         return "speaking as fast as possible"
     return "speaking a bit faster than normal"
+
+
+_NORM_TAG_RE = re.compile(r"[\[\{][^\]\}]*[\]\}]")
+
+
+def norm_text(text: str) -> str:
+    """Comparison key: tags removed, lowercase, punctuation/space-insensitive."""
+    text = _NORM_TAG_RE.sub(" ", text)
+    return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split())
 
 
 def estimate_seconds(text: str) -> float:
@@ -362,6 +392,7 @@ class SynthEngine:
         cfg_value: float,
         inference_timesteps: int,
         seed: int,
+        constant_identity: bool = True,
     ) -> None:
         self.model_id = model_id
         self.prompt_wav = prompt_wav
@@ -372,6 +403,9 @@ class SynthEngine:
         self.cfg_value = cfg_value
         self.inference_timesteps = inference_timesteps
         self.seed = seed
+
+        self.voice_descriptor = voice_descriptor
+        self.constant_identity = constant_identity
 
         # Soft-voice style table, composed from the descriptor.
         self.style_tags = build_style_tags(voice_descriptor)
@@ -551,6 +585,13 @@ class SynthEngine:
         elif style and self.default_style and self.default_style not in style:
             style = f"{style}; {self.default_style}"
 
+        # VOICE CONSISTENCY: a block with a style prefix and a block with
+        # none are conditioned differently, which can sound like two
+        # different speakers within one reply. Give every block the same
+        # identity clause (controllable mode; ultimate mode sends no prefix).
+        if style is None and not ultimate and self.constant_identity:
+            style = self.voice_descriptor
+
         text_out = text if (ultimate or not style) else self._styled_text(text, style)
 
         kwargs: dict[str, Any] = {
@@ -646,6 +687,13 @@ class BridgeHandler(AsyncEventHandler):
         self._instr: Optional[str] = None
 
         self._pending_sentences: list[str] = []
+        self._first_queued = False
+
+        # Stream bookkeeping (plain one-shot requests / late duplicates)
+        self._streaming = False
+        self._stream_text = ""
+        self._last_stream_norm = ""
+        self._last_stream_end = 0.0
 
         self._work_q: Optional[asyncio.Queue] = None
         self._play_q: Optional[asyncio.Queue] = None
@@ -674,6 +722,13 @@ class BridgeHandler(AsyncEventHandler):
 
     def _feed_sentence(self, sentence: str) -> None:
         self._pending_sentences.append(sentence)
+        if not self._first_queued:
+            # LATENCY-FIRST: the opening sentence goes out on its own instead
+            # of waiting for ~4 s of text (which, for a short reply, meant
+            # waiting for the whole LLM answer).
+            self._first_queued = True
+            self._flush_pending()
+            return
         est = sum(estimate_seconds(s) for s in self._pending_sentences)
         if est >= self._min_merged or len(self._pending_sentences) >= 6:
             self._flush_pending()
@@ -811,6 +866,24 @@ class BridgeHandler(AsyncEventHandler):
             )
             buf.clear()
 
+    # -- utterance helpers ------------------------------------------------------------
+
+    def _reset_utterance(self) -> None:
+        self._stash = ""
+        self._buf = ""
+        self._got_chunks = False
+        self._audio_started = False
+        self._instr = None
+        self._pending_sentences = []
+        self._first_queued = False
+
+    async def _finish_utterance(self) -> None:
+        """Flush, wait for all audio to be written, close the audio stream."""
+        await self._stop_pipeline()
+        if self._audio_started:
+            await self.write_event(AudioStop().event())
+            self._audio_started = False
+
     # -- wyoming event handling -----------------------------------------------------
 
     async def handle_event(self, event: Event) -> bool:
@@ -819,20 +892,17 @@ class BridgeHandler(AsyncEventHandler):
             return True
 
         if SynthesizeStart.is_type(event.type):
-            self._stash = ""
-            self._buf = ""
-            self._got_chunks = False
-            self._audio_started = False
-            self._instr = None
-            self._pending_sentences = []
+            self._reset_utterance()
+            self._streaming = True
+            self._stream_text = ""
             await self._start_pipeline()
             return True
 
         if SynthesizeChunk.is_type(event.type):
             self._got_chunks = True
-            for sentence in self._take_sentences(
-                SynthesizeChunk.from_event(event).text
-            ):
+            chunk_text = SynthesizeChunk.from_event(event).text
+            self._stream_text += chunk_text
+            for sentence in self._take_sentences(chunk_text):
                 self._feed_sentence(sentence)
             return True
 
@@ -845,19 +915,48 @@ class BridgeHandler(AsyncEventHandler):
             else:
                 text = self._stash
                 self._stash = ""
+                self._stream_text = text
                 if text.strip():
                     self._feed_sentence(text.strip())
 
-            await self._stop_pipeline()
+            await self._finish_utterance()
 
-            if self._audio_started:
-                await self.write_event(AudioStop().event())
-                self._audio_started = False
+            self._streaming = False
+            self._last_stream_norm = norm_text(self._stream_text)
+            self._last_stream_end = time.monotonic()
             await self.write_event(SynthesizeStopped().event())
             return True
 
         if Synthesize.is_type(event.type):
-            self._stash = Synthesize.from_event(event).text
+            text = Synthesize.from_event(event).text or ""
+
+            # (1) Compat one-shot that HA sends alongside a stream: ignore
+            #     (but keep it as the text for a start/stop with no chunks).
+            if self._streaming:
+                self._stash = text
+                return True
+
+            # (2) Late duplicate right after a finished stream.
+            if (self._last_stream_norm
+                    and time.monotonic() - self._last_stream_end
+                    < LATE_DUPLICATE_WINDOW_S
+                    and norm_text(text) == self._last_stream_norm):
+                _LOGGER.warning(
+                    "late duplicate of finished stream suppressed: %r",
+                    text[:60])
+                return True
+
+            # (3) Genuine non-streaming request (tts.speak, "Try voice", ...)
+            if text.strip():
+                self._reset_utterance()
+                await self._start_pipeline()
+                for sentence in self._take_sentences(text + " "):
+                    self._feed_sentence(sentence)
+                tail = self._buf.strip()
+                self._buf = ""
+                if tail:
+                    self._feed_sentence(tail)
+                await self._finish_utterance()
             return True
 
         return True
@@ -903,6 +1002,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Baseline style parenthetical applied to every utterance "
              "(controllable mode only)",
+    )
+    p.add_argument(
+        "--no-constant-identity", action="store_true",
+        help="Do not add the identity clause to unstyled blocks (default: "
+             "every block in controllable mode carries it, so styled and "
+             "unstyled sentences stay conditioned alike).",
     )
     p.add_argument("--speed", type=float, default=1.0, help="1.0 = normal")
     p.add_argument("--cfg-value", type=float, default=2.0, help="Classifier-free guidance")
@@ -959,6 +1064,7 @@ async def main() -> None:
         cfg_value=args.cfg_value,
         inference_timesteps=args.inference_timesteps,
         seed=args.seed,
+        constant_identity=not args.no_constant_identity,
     )
 
     ready = asyncio.Event()
