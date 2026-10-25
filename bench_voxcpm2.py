@@ -51,9 +51,11 @@ def main() -> None:
                     help="unstyled sentences get no prefix at all")
     ap.add_argument("--style", default="",
                     help="optional style tag to apply, e.g. warm, sad")
-    ap.add_argument("--text",
-                    default="Well, that is a surprise. [laughing] I did not "
-                            "expect that at all. Please, come in and sit down.")
+    ap.add_argument("--text", action="append", default=None,
+                    help="sentence to render; repeat for several (default: "
+                         "three varied sentences). A seed that sounds right "
+                         "on ONE sentence can drift on the next, so judge "
+                         "seeds across several.")
     ap.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3, 7, 42, 123])
     ap.add_argument("--cfg-value", type=float, default=2.0)
     ap.add_argument("--timesteps", type=int, default=10)
@@ -77,27 +79,34 @@ def main() -> None:
     )
     eng.load()
 
-    text = f"[{args.style}] {args.text}" if args.style else args.text
-    clean, style = bv.parse_tags(text, eng.style_tags, eng.allow_inline_tags,
-                                 base_voice=args.descriptor)
+    texts = args.text or [
+        "Well, that is a surprise. [laughing] I did not expect that at all.",
+        "The kettle is on, so please come in and sit down for a moment.",
+        "I checked the weather, and it should stay dry until about six.",
+    ]
     os.makedirs(args.out, exist_ok=True)
     tag = "desc" if args.descriptor else "nodesc"
     if args.no_constant_identity:
         tag += "_noident"
 
     print(f"mode={args.mode} descriptor={args.descriptor!r} "
-          f"cfg={args.cfg_value} steps={args.timesteps}")
-    print(f"text : {clean!r}\nstyle: {style!r}\n")
-    print("seed  audio_s  gen_s   file")
+          f"cfg={args.cfg_value} steps={args.timesteps}\n")
+    print("seed  text  audio_s  gen_s   file")
     for seed in args.seeds:
         eng.seed = seed
-        t0 = time.monotonic()
-        pcm = b"".join(bv.to_pcm16(o) for o in eng._generate(clean, style))
-        gen = time.monotonic() - t0
-        audio = np.frombuffer(pcm, dtype="<i2")
-        path = os.path.join(args.out, f"{args.mode}_{tag}_seed{seed}.wav")
-        sf.write(path, audio, eng.sample_rate)
-        print(f"{seed:4d}  {len(audio) / eng.sample_rate:7.2f}  {gen:5.2f}   {path}")
+        for i, raw in enumerate(texts, 1):
+            text = f"[{args.style}] {raw}" if args.style else raw
+            clean, style = bv.parse_tags(text, eng.style_tags,
+                                         eng.allow_inline_tags,
+                                         base_voice=args.descriptor)
+            t0 = time.monotonic()
+            pcm = b"".join(bv.to_pcm16(o) for o in eng._generate(clean, style))
+            gen = time.monotonic() - t0
+            audio = np.frombuffer(pcm, dtype="<i2")
+            path = os.path.join(args.out, f"{args.mode}_{tag}_seed{seed}_t{i}.wav")
+            sf.write(path, audio, eng.sample_rate)
+            print(f"{seed:4d}  {i:4d}  {len(audio) / eng.sample_rate:7.2f}  "
+                  f"{gen:5.2f}   {path}")
     print(f"\nreference for comparison: {args.prompt_wav}")
 
 
