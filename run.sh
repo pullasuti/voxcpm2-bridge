@@ -209,6 +209,12 @@ ARGS=(
     --voice "$VOICE_NAME"
 )
 
+# MAX_STYLE_TAGS: cap on style tags combined per block (0 = no limit).
+MAX_STYLE_TAGS="$(safe_num MAX_STYLE_TAGS 0 int)"
+if [ "$MAX_STYLE_TAGS" -gt 0 ]; then
+    ARGS+=(--max-style-tags "$MAX_STYLE_TAGS")
+fi
+
 # VOICE_DESCRIPTOR: identity clause put in front of every style instruction.
 # Set it (even to empty) to override the bridge default; empty = delivery only.
 if [ "${VOICE_DESCRIPTOR+set}" = "set" ]; then

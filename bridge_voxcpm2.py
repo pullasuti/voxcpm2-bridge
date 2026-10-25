@@ -241,10 +241,31 @@ _ABBREVIATIONS = {
 }
 
 
+def combine_styles(parts: list[str], base_voice: str) -> str:
+    """Join several composed style strings into ONE instruction.
+
+    Every entry in the style table is "<base voice>, <delivery clause>".
+    Stacking them naively repeated the base voice once per tag
+    ("base, warm; base, sad"). Keep the base once and chain the delivery
+    clauses: "base, warm clause, sad clause". Identical clauses (e.g.
+    [warm] and [friendly]) are only used once.
+    """
+    prefix = f"{base_voice}, " if base_voice and base_voice.strip() else ""
+    clauses: list[str] = []
+    for part in parts:
+        clause = part[len(prefix):] if prefix and part.startswith(prefix) else part
+        if clause and clause not in clauses:
+            clauses.append(clause)
+    body = ", ".join(clauses)
+    return f"{base_voice}, {body}" if prefix else body
+
+
 def parse_tags(
     text: str,
     style_tags: dict[str, str],
     allow_inline: bool = True,
+    max_styles: int = 0,
+    base_voice: str = "",
 ) -> tuple[str, Optional[str]]:
     """Split text into (spoken text, style instruction or None).
 
@@ -255,6 +276,10 @@ def parse_tags(
 
     When allow_inline is False (ultimate cloning mode, where upstream
     suppresses tags), inline tags are stripped from the text entirely.
+
+    Several style tags in one block are combined into a single instruction
+    (see combine_styles). max_styles > 0 caps how many are used (the first
+    ones win); 0 means no limit.
     """
     tags: list[str] = []
     out: list[str] = []
@@ -281,7 +306,12 @@ def parse_tags(
                 _LOGGER.warning(
                     "tag %r has no VoxCPM2 equivalent; removing it", tag)
         elif folded_style in style_tags:
-            tags.append(style_tags[folded_style])
+            if max_styles <= 0 or len(tags) < max_styles:
+                tags.append(style_tags[folded_style])
+            else:
+                _LOGGER.info(
+                    "ignoring extra style tag %r (--max-style-tags %d)",
+                    tag, max_styles)
         else:
             _LOGGER.warning("dropping tag %r (no equivalent)", tag)
 
@@ -292,7 +322,7 @@ def parse_tags(
 
     clean = " ".join("".join(out).split())
     clean = re.sub(r"\s+([,.!?;:])", r"\1", clean)  # "[sigh] ," -> "[sigh],"
-    return clean, ("; ".join(tags) if tags else None)
+    return clean, (combine_styles(tags, base_voice) if tags else None)
 
 
 def speed_hint(speed: float) -> Optional[str]:
@@ -394,6 +424,7 @@ class SynthEngine:
         inference_timesteps: int,
         seed: int,
         constant_identity: bool = True,
+        max_style_tags: int = 0,
     ) -> None:
         self.model_id = model_id
         self.prompt_wav = prompt_wav
@@ -407,6 +438,7 @@ class SynthEngine:
 
         self.voice_descriptor = voice_descriptor
         self.constant_identity = constant_identity
+        self.max_style_tags = max_style_tags
 
         # Soft-voice style table, composed from the descriptor.
         self.style_tags = build_style_tags(voice_descriptor)
@@ -781,6 +813,8 @@ class BridgeHandler(AsyncEventHandler):
                 text,
                 style_tags=self.engine.style_tags,
                 allow_inline=self.engine.allow_inline_tags,
+                max_styles=self.engine.max_style_tags,
+                base_voice=self.engine.voice_descriptor,
             )
             if not clean:
                 continue
@@ -1006,6 +1040,11 @@ def parse_args() -> argparse.Namespace:
              "(controllable mode only)",
     )
     p.add_argument(
+        "--max-style-tags", type=int, default=0,
+        help="Max style tags combined into one instruction per block "
+             "(first ones win). 0 = no limit: all are chained together.",
+    )
+    p.add_argument(
         "--no-constant-identity", action="store_true",
         help="Do not add the identity clause to unstyled blocks (default: "
              "every block in controllable mode carries it, so styled and "
@@ -1067,6 +1106,7 @@ async def main() -> None:
         inference_timesteps=args.inference_timesteps,
         seed=args.seed,
         constant_identity=not args.no_constant_identity,
+        max_style_tags=args.max_style_tags,
     )
 
     ready = asyncio.Event()
