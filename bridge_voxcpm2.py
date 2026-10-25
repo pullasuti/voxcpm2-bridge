@@ -183,12 +183,13 @@ STYLE_ORDER = [
 
 def build_style_tags(base_voice: str) -> dict[str, str]:
     """Compose the full tag table: identity clause + delivery clause."""
-    tags = {
-        key: f"{base_voice}, {clause}"
-        for key, clause in _DELIVERY_CLAUSES.items()
-    }
+    def compose(clause: str) -> str:
+        # an empty descriptor means "delivery only": no identity clause
+        return f"{base_voice}, {clause}" if base_voice.strip() else clause
+
+    tags = {key: compose(c) for key, c in _DELIVERY_CLAUSES.items()}
     for key, clause in _TAG_FALLBACKS.items():
-        tags[key] = f"{base_voice}, {clause}"
+        tags[key] = compose(clause)
     return tags
 
 
@@ -995,7 +996,8 @@ def parse_args() -> argparse.Namespace:
         "--voice-descriptor", default=DEFAULT_BASE_VOICE,
         help="Identity clause shared by ALL style instructions. Constant "
              "across blocks for timbre stability; tune per reference "
-             "voice, e.g. 'a soft, delicate, gentle voice'.",
+             "voice, e.g. 'a soft, delicate, gentle voice'. Pass an empty "
+             "string for delivery-only instructions (no voice description).",
     )
     p.add_argument(
         "--style",

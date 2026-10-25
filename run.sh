@@ -209,6 +209,12 @@ ARGS=(
     --voice "$VOICE_NAME"
 )
 
+# VOICE_DESCRIPTOR: identity clause put in front of every style instruction.
+# Set it (even to empty) to override the bridge default; empty = delivery only.
+if [ "${VOICE_DESCRIPTOR+set}" = "set" ]; then
+    ARGS+=(--voice-descriptor "$VOICE_DESCRIPTOR")
+fi
+
 echo ">>> Starting Wyoming bridge on port $VOXCPM_BRIDGE_PORT"
 echo "    voice:   $VOICE_NAME ($PROMPT_WAV)"
 echo "    clone:   ${CLONING_MODE:-auto} (ultimate needs PROMPT_TEXT)"
