@@ -122,6 +122,10 @@ _LOGGER = logging.getLogger(__name__)
 # Rough speech-rate estimate for merging decisions.
 WORDS_PER_SECOND = 2.8
 
+# The first block is sent alone for latency, but only once it holds at least
+# this much estimated speech: shorter blocks make the LoRA babble.
+MIN_FIRST_BLOCK_SECONDS = 1.5
+
 # A one-shot synthesize arriving this soon after synthesize-stop, with
 # matching text, is a late duplicate of the stream just played, not a request.
 LATE_DUPLICATE_WINDOW_S = 3.0
@@ -907,7 +911,13 @@ class BridgeHandler(AsyncEventHandler):
         if not self._first_queued:
             # LATENCY-FIRST: the opening sentence goes out on its own instead
             # of waiting for ~4 s of text (which, for a short reply, meant
-            # waiting for the whole LLM answer).
+            # waiting for the whole LLM answer). But never a fragment: the
+            # LoRA babbles on blocks under ~1.5 s ("Done!", "Sure."), so hold
+            # those for the next sentence. The end-of-reply flush still sends
+            # a reply that is short as a whole.
+            est = sum(estimate_seconds(s) for s in self._pending_sentences)
+            if est < MIN_FIRST_BLOCK_SECONDS and len(self._pending_sentences) < 3:
+                return
             self._first_queued = True
             self._flush_pending()
             return
