@@ -67,6 +67,21 @@ fi
 # Default: auto (ultimate if PROMPT_TEXT set, else controllable)
 export CLONING_MODE="${CLONING_MODE:-}"
 
+# LORA_PATH: directory with a VoxCPM2 LoRA (lora_weights.safetensors +
+# lora_config.json [+ style_tags.json]). Relative paths are relative to this
+# folder. When set, CLONING_MODE defaults to "lora" (no reference audio);
+# CLONING_MODE=controllable uses the LoRA AND the reference clip.
+LORA_PATH="${LORA_PATH:-}"
+LORA_PATH="${LORA_PATH//$'\r'/}"
+if [ -n "$LORA_PATH" ]; then
+    case "$LORA_PATH" in /*) ;; *) LORA_PATH="$DIR/$LORA_PATH" ;; esac
+    if [ ! -f "$LORA_PATH/lora_weights.safetensors" ] || [ ! -f "$LORA_PATH/lora_config.json" ]; then
+        echo "ERROR: LORA_PATH=$LORA_PATH needs lora_weights.safetensors and lora_config.json" >&2
+        exit 1
+    fi
+    [ -n "$CLONING_MODE" ] || CLONING_MODE="lora"
+fi
+
 BRIDGE_SCRIPT="${BRIDGE_SCRIPT:-$DIR/bridge_voxcpm2.py}"
 
 if [ ! -f "$BRIDGE_SCRIPT" ]; then
@@ -172,12 +187,14 @@ fi
 # Sanity checks before launching
 # ---------------------------------------------------------------------------
 
-if [ ! -f "$PROMPT_WAV" ]; then
+if [ "$CLONING_MODE" != "lora" ] && [ ! -f "$PROMPT_WAV" ]; then
     echo "WARNING: prompt WAV not found at $PROMPT_WAV" >&2
     echo "         cloning will fall back to default voice unless --prompt-wav is fixed" >&2
 fi
 
-if [ -z "$PROMPT_TEXT" ]; then
+if [ "$CLONING_MODE" = "lora" ]; then
+    :   # the voice is in the LoRA; no reference or transcript needed
+elif [ -z "$PROMPT_TEXT" ]; then
     echo "WARNING: PROMPT_TEXT is not set — ultimate cloning disabled." >&2
     echo "         Expect audible voice drift between sentence blocks." >&2
     echo "         Set PROMPT_TEXT to the exact transcript of the reference WAV." >&2
@@ -208,6 +225,9 @@ ARGS=(
     --seed "$VOICE_SEED"
     --voice "$VOICE_NAME"
 )
+if [ -n "$LORA_PATH" ]; then
+    ARGS+=(--lora "$LORA_PATH")
+fi
 
 # MAX_STYLE_TAGS: cap on style tags combined per block (0 = no limit).
 MAX_STYLE_TAGS="$(safe_num MAX_STYLE_TAGS 0 int)"
@@ -224,6 +244,7 @@ fi
 echo ">>> Starting Wyoming bridge on port $VOXCPM_BRIDGE_PORT"
 echo "    voice:   $VOICE_NAME ($PROMPT_WAV)"
 echo "    clone:   ${CLONING_MODE:-auto} (ultimate needs PROMPT_TEXT)"
+echo "    lora:    ${LORA_PATH:-none}"
 echo "    seed:    $VOICE_SEED"
 echo "    GPU:     CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "    deps:    voxcpm @ ${VOXCPM_COMMIT_HASH:-git/main HEAD}"

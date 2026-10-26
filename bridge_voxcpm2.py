@@ -61,6 +61,15 @@ load-later startup. VoxCPM2-specific behavior:
     an equivalent exists;
     tags with no equivalent are dropped with a warning rather than
     fed to the model.
+  * LoRA VOICE (--lora DIR) — loads a VoxCPM2 LoRA trained on the voice
+    (lora_weights.safetensors + lora_config.json, optionally
+    style_tags.json). The voice then lives in the weights, so the
+    default --cloning-mode becomes "lora": no reference audio at all,
+    style prefixes and inline tags active. --cloning-mode controllable
+    adds the reference clip on top. In LoRA mode the style table is the
+    LoRA's own training tags (style_tags.json), the identity clause is
+    not used (the LoRA never saw it), one style tag per block, and the
+    prefix is written exactly as in training: "(tag)Text".
   * 48 kHz OUTPUT, 16 kHz REFERENCE INPUT — reference resampled once
     at startup (polyphase filter if scipy is available, linear
     interpolation otherwise).
@@ -181,6 +190,70 @@ STYLE_ORDER = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# LoRA style vocabulary
+#
+# A LoRA trained by the voxcpm_lora_pipeline learned ONE exact tag string per
+# emotion (corpus.yaml -> voxcpm_tag), so in LoRA mode the style table must use
+# those strings verbatim. They are read from <lora>/style_tags.json; this
+# default matches the pipeline's shipped corpus.yaml. "" = neutral (no prefix).
+# ---------------------------------------------------------------------------
+
+DEFAULT_LORA_TAGS = {
+    "neutral": "",
+    "happy": "happy, cheerful tone",
+    "sad": "sad, quiet and slow",
+    "angry": "angry, sharp and forceful",
+    "surprised": "surprised, astonished",
+    "fearful": "scared, trembling and anxious",
+    "gentle": "warm, gentle and calm",
+    "whisper": "soft, gentle whisper",
+}
+
+# Tags the LLM prompt already uses, folded onto the LoRA's emotions.
+# Only applied when the target emotion exists in the LoRA's table.
+LORA_STYLE_ALIASES = {
+    "warm": "gentle", "tender": "gentle", "friendly": "gentle",
+    "thoughtful": "gentle", "kind": "gentle",
+    "cheerful": "happy", "happily": "happy", "excited": "happy",
+    "excitedly": "happy", "playful": "happy", "joyful": "happy",
+    "sadly": "sad", "melancholy": "sad",
+    "angrily": "angry", "annoyed": "angry", "frustrated": "angry",
+    "surprise": "surprised", "shocked": "surprised", "amazed": "surprised",
+    "scared": "fearful", "afraid": "fearful", "fear": "fearful",
+    "nervous": "fearful", "anxious": "fearful",
+    "softly": "whisper", "quieter": "whisper", "quiet": "whisper",
+    "whispering": "whisper",
+    "serious": "neutral", "calm": "neutral", "confident": "neutral",
+}
+
+
+def load_lora_tags(lora_dir: str) -> dict[str, str]:
+    """Read <lora>/style_tags.json ({"tags": {...}} or a plain mapping)."""
+    import json  # noqa: PLC0415
+
+    path = Path(lora_dir) / "style_tags.json"
+    if not path.is_file():
+        _LOGGER.warning(
+            "%s not found - using the pipeline's default emotion tags. If "
+            "you changed voxcpm_tag values in corpus.yaml, export the LoRA "
+            "with export_lora.py so the bridge uses the trained strings.", path)
+        return dict(DEFAULT_LORA_TAGS)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    tags = data.get("tags", data) if isinstance(data, dict) else {}
+    tags = {str(k).lower(): str(v or "") for k, v in tags.items()}
+    _LOGGER.info("LoRA style tags from %s: %s", path, ", ".join(sorted(tags)))
+    return tags
+
+
+def build_lora_style_tags(tags: dict[str, str]) -> dict[str, str]:
+    table = dict(tags)
+    for alias, target in LORA_STYLE_ALIASES.items():
+        if target in tags and alias not in table:
+            table[alias] = tags[target]
+    return table
+
+
 def build_style_tags(base_voice: str) -> dict[str, str]:
     """Compose the full tag table: identity clause + delivery clause."""
     def compose(clause: str) -> str:
@@ -291,7 +364,8 @@ def parse_tags(
             out.append(text[pos:m.start()])
 
         key = tag.lower()
-        folded_style = STYLE_TAG_ALIASES.get(key, key)
+        # a direct hit wins (LoRA tables carry their own aliases)
+        folded_style = key if key in style_tags else STYLE_TAG_ALIASES.get(key, key)
         folded_inline = TAG_ALIASES.get(key, key)
 
         if folded_inline in CANON_INLINE:
@@ -425,7 +499,9 @@ class SynthEngine:
         seed: int,
         constant_identity: bool = True,
         max_style_tags: int = 0,
+        lora_path: str = "",
     ) -> None:
+        self.lora_path = lora_path
         self.model_id = model_id
         self.prompt_wav = prompt_wav
         self.prompt_text = prompt_text
@@ -440,8 +516,20 @@ class SynthEngine:
         self.constant_identity = constant_identity
         self.max_style_tags = max_style_tags
 
-        # Soft-voice style table, composed from the descriptor.
-        self.style_tags = build_style_tags(voice_descriptor)
+        if lora_path:
+            # The LoRA learned bare "(tag)Text" prefixes: no identity clause,
+            # one tag per block, its own tag strings.
+            if voice_descriptor:
+                _LOGGER.info("LoRA mode: ignoring --voice-descriptor %r",
+                             voice_descriptor)
+            self.voice_descriptor = ""
+            self.constant_identity = False
+            if self.max_style_tags <= 0:
+                self.max_style_tags = 1
+            self.style_tags = build_lora_style_tags(load_lora_tags(lora_path))
+        else:
+            # Soft-voice style table, composed from the descriptor.
+            self.style_tags = build_style_tags(voice_descriptor)
 
         self.model: Any = None
         self.reference_wav: Optional[str] = None
@@ -525,12 +613,39 @@ class SynthEngine:
         _LOGGER.info("loading %s", self.model_id)
         t0 = time.monotonic()
 
-        self.model = VoxCPM.from_pretrained(self.model_id, load_denoiser=False)
+        kwargs: dict[str, Any] = {"load_denoiser": False}
+        if self.lora_path:
+            lora = Path(self.lora_path)
+            if not (lora / "lora_weights.safetensors").is_file() and \
+                    not (lora / "lora_weights.ckpt").is_file():
+                raise FileNotFoundError(f"no lora_weights.safetensors in {lora}")
+            if not (lora / "lora_config.json").is_file():
+                # without it voxcpm silently assumes r=8 and the weights won't fit
+                raise FileNotFoundError(
+                    f"no lora_config.json in {lora}: copy it from the training "
+                    "checkpoint (it holds the rank the LoRA was trained with)")
+            kwargs["lora_weights_path"] = str(lora)
+            _LOGGER.info("loading LoRA from %s", lora)
+        try:
+            self.model = VoxCPM.from_pretrained(self.model_id, **kwargs)
+        except TypeError as err:
+            if self.lora_path and "lora_weights_path" in str(err):
+                raise RuntimeError(
+                    "installed voxcpm has no LoRA support - update it "
+                    "(VOXCPM_COMMIT_HASH in .env) and rm .deps-stamp") from err
+            raise
         self.sample_rate = int(self.model.tts_model.sample_rate)
-        self.reference_wav = ensure_reference_16k(self.prompt_wav)
+        if self.lora_path:
+            self._check_lora()
+        if self.prompt_wav and self._effective_mode != "lora":
+            self.reference_wav = ensure_reference_16k(self.prompt_wav)
         self._introspect_signature()
 
-        if self._effective_mode == "ultimate":
+        if self._effective_mode == "lora":
+            _LOGGER.info(
+                "cloning mode: LORA (no reference audio - the voice comes "
+                "from the LoRA). Style tags and inline tags are active.")
+        elif self._effective_mode == "ultimate":
             if self.prompt_text:
                 _LOGGER.info(
                     "cloning mode: ULTIMATE (dual-pathway reference). "
@@ -552,27 +667,59 @@ class SynthEngine:
                 "fidelity is slightly lower than ultimate mode."
             )
 
-        _LOGGER.info(
-            "style vocabulary: identity clause %r shared by %d tags "
-            "(low-arousal delivery)",
-            self.style_tags["warm"].split(",")[0], len(self.style_tags),
-        )
+        if self.lora_path:
+            _LOGGER.info(
+                "style vocabulary: LoRA training tags (%d incl. aliases), "
+                "max %d per block", len(self.style_tags), self.max_style_tags)
+        else:
+            _LOGGER.info(
+                "style vocabulary: identity clause %r shared by %d tags "
+                "(low-arousal delivery)",
+                self.style_tags["warm"].split(",")[0], len(self.style_tags),
+            )
 
         _LOGGER.info(
             "model ready in %.1fs (sample_rate=%d, reference=%s)",
             time.monotonic() - t0, self.sample_rate, self.reference_wav,
         )
 
+    def _check_lora(self) -> None:
+        """Fail loudly if the LoRA did not actually load: voxcpm only prints
+        the loaded/skipped key counts to stderr and carries on either way."""
+        import json  # noqa: PLC0415
+
+        tm = self.model.tts_model
+        if not hasattr(tm, "get_lora_state_dict"):
+            _LOGGER.warning("cannot verify LoRA (old voxcpm build)")
+            return
+        b_mats = [v for k, v in tm.get_lora_state_dict().items() if "lora_B" in k]
+        if not b_mats:
+            raise RuntimeError("LoRA requested but the model has no LoRA layers")
+        loaded = sum(1 for v in b_mats if float(v.abs().sum()) > 0)
+        if loaded == 0:
+            raise RuntimeError(
+                f"LoRA layers are all zero - no weights from {self.lora_path} "
+                "matched the model (wrong base model or voxcpm version?)")
+        cfg = json.loads((Path(self.lora_path) / "lora_config.json")
+                         .read_text(encoding="utf-8")).get("lora_config", {})
+        _LOGGER.info("LoRA active: %d/%d layers loaded (r=%s, alpha=%s)",
+                     loaded, len(b_mats), cfg.get("r"), cfg.get("alpha"))
+
     def warm_up(self) -> None:
         """Run one tiny synthesis so torch.compile pays its one-time
         cost here, during startup, instead of on the first request."""
         _LOGGER.info("warm-up synthesis (compiling kernels)...")
         t0 = time.monotonic()
+        if self.lora_path:
+            styled = next((v for v in self.style_tags.values() if v), None)
+        else:
+            styled = "speaking with a neutral tone"
         try:
-            for out in self._generate(
-                "Warm up.", "speaking with a neutral tone"
-            ):
+            for out in self._generate("Warm up.", styled):
                 _ = to_pcm16(out)
+            if self.lora_path:  # plain (neutral) path too
+                for out in self._generate("Warm up.", None):
+                    _ = to_pcm16(out)
         except Exception:
             _LOGGER.warning(
                 "warm-up synthesis failed — torch.compile cost will land "
@@ -594,12 +741,14 @@ class SynthEngine:
         if self.speed != 1.0:
             parts.append(speed_hint(self.speed))
         if parts:
-            return "(" + "; ".join(parts) + ") " + text
+            # LoRA was trained on "(tag)Text" with no space: match it exactly
+            sep = "" if self.lora_path else " "
+            return "(" + "; ".join(parts) + ")" + sep + text
         return text
 
     @property
     def allow_inline_tags(self) -> bool:
-        return self._effective_mode == "controllable"
+        return self._effective_mode in ("controllable", "lora")
 
     def _generate(self, text: str, style: Optional[str]) -> Iterator[Any]:
         ultimate = self._effective_mode == "ultimate"
@@ -633,7 +782,7 @@ class SynthEngine:
             "inference_timesteps": self.inference_timesteps,
         }
 
-        if self.reference_wav:
+        if self.reference_wav and self._effective_mode != "lora":
             kwargs["reference_wav_path"] = self.reference_wav
             if ultimate:
                 kwargs["prompt_wav_path"] = self.reference_wav
@@ -1009,8 +1158,15 @@ def parse_args() -> argparse.Namespace:
         help="HuggingFace model id (weights auto-download on first run)",
     )
     p.add_argument(
-        "--prompt-wav", required=True,
-        help="Reference speaker WAV for cloning (resampled to 16 kHz if needed)",
+        "--prompt-wav", default="",
+        help="Reference speaker WAV for cloning (resampled to 16 kHz if "
+             "needed). Required unless --cloning-mode lora.",
+    )
+    p.add_argument(
+        "--lora", default="",
+        help="Directory with a VoxCPM2 LoRA (lora_weights.safetensors + "
+             "lora_config.json, optional style_tags.json). Makes 'lora' the "
+             "default cloning mode.",
     )
     p.add_argument(
         "--prompt-text", default="",
@@ -1019,12 +1175,15 @@ def parse_args() -> argparse.Namespace:
              "emotion control, which upstream ignores in that mode.",
     )
     p.add_argument(
-        "--cloning-mode", choices=("ultimate", "controllable"),
+        "--cloning-mode", choices=("ultimate", "controllable", "lora"),
         default=None,
         help="ultimate: dual-pathway reference, best timbre, NO style/"
              "tags (default when --prompt-text is set). controllable: "
              "reference only, style parentheticals + inline tags work, "
-             "slightly less faithful clone (default without --prompt-text).",
+             "slightly less faithful clone (default without --prompt-text). "
+             "lora: no reference, the voice comes from --lora (default "
+             "when --lora is set). With --lora, controllable = LoRA + "
+             "reference clip.",
     )
     p.add_argument(
         "--voice-descriptor", default=DEFAULT_BASE_VOICE,
@@ -1083,7 +1242,14 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
 
     if args.cloning_mode is None:
-        args.cloning_mode = "ultimate" if args.prompt_text else "controllable"
+        if args.lora:
+            args.cloning_mode = "lora"
+        else:
+            args.cloning_mode = "ultimate" if args.prompt_text else "controllable"
+    if args.cloning_mode == "lora" and not args.lora:
+        p.error("--cloning-mode lora needs --lora DIR")
+    if args.cloning_mode != "lora" and not args.prompt_wav:
+        p.error(f"--cloning-mode {args.cloning_mode} needs --prompt-wav")
     return args
 
 
@@ -1091,8 +1257,10 @@ async def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
 
-    if not Path(args.prompt_wav).is_file():
+    if args.cloning_mode != "lora" and not Path(args.prompt_wav).is_file():
         raise SystemExit(f"prompt WAV not found: {args.prompt_wav}")
+    if args.lora and not Path(args.lora).is_dir():
+        raise SystemExit(f"LoRA directory not found: {args.lora}")
 
     engine = SynthEngine(
         model_id=args.model_id,
@@ -1107,6 +1275,7 @@ async def main() -> None:
         seed=args.seed,
         constant_identity=not args.no_constant_identity,
         max_style_tags=args.max_style_tags,
+        lora_path=args.lora,
     )
 
     ready = asyncio.Event()
@@ -1138,7 +1307,8 @@ async def main() -> None:
                         name=args.voice,
                         attribution=attribution,
                         installed=True,
-                        description=f"VoxCPM2 cloned voice ({args.voice})",
+                        description=(f"VoxCPM2 LoRA voice ({args.voice})" if args.lora
+                                     else f"VoxCPM2 cloned voice ({args.voice})"),
                         version="2B",
                         languages=["en"],
                     )

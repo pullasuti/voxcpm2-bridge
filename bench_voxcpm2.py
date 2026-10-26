@@ -43,8 +43,12 @@ def main() -> None:
     ap.add_argument("--prompt-text", default=os.environ.get("PROMPT_TEXT", ""),
                     help="exact transcript (needed for --mode ultimate; "
                          "default: $PROMPT_TEXT)")
-    ap.add_argument("--mode", choices=("controllable", "ultimate"),
-                    default="controllable")
+    ap.add_argument("--mode", choices=("controllable", "ultimate", "lora"),
+                    default=None,
+                    help="default: lora when --lora is given, else controllable")
+    ap.add_argument("--lora", default=os.environ.get("LORA_PATH", ""),
+                    help="LoRA directory (default: $LORA_PATH); compare with "
+                         "and without it to hear what the LoRA changes")
     ap.add_argument("--descriptor", default=bv.DEFAULT_BASE_VOICE,
                     help="identity clause; '' = delivery-only instructions")
     ap.add_argument("--no-constant-identity", action="store_true",
@@ -63,7 +67,11 @@ def main() -> None:
     ap.add_argument("--out", default="bench_out")
     args = ap.parse_args()
 
-    if not os.path.isfile(args.prompt_wav):
+    if args.mode is None:
+        args.mode = "lora" if args.lora else "controllable"
+    if args.mode == "lora" and not args.lora:
+        ap.error("--mode lora needs --lora DIR")
+    if args.mode != "lora" and not os.path.isfile(args.prompt_wav):
         ap.error(f"reference wav not found: {args.prompt_wav!r} - pass "
                  "--prompt-wav voices/yourfile.wav (a plain 'source .env' "
                  "does not export PROMPT_WAV, so $PROMPT_WAV may be empty)")
@@ -76,6 +84,7 @@ def main() -> None:
         voice_descriptor=args.descriptor, default_style=None, speed=1.0,
         cfg_value=args.cfg_value, inference_timesteps=args.timesteps,
         seed=args.seeds[0], constant_identity=not args.no_constant_identity,
+        lora_path=args.lora,
     )
     eng.load()
 
@@ -85,9 +94,14 @@ def main() -> None:
         "I checked the weather, and it should stay dry until about six.",
     ]
     os.makedirs(args.out, exist_ok=True)
-    tag = "desc" if args.descriptor else "nodesc"
-    if args.no_constant_identity:
-        tag += "_noident"
+    if args.lora:
+        tag = "lora_" + os.path.basename(os.path.normpath(args.lora))
+        if args.style:
+            tag += "_" + args.style
+    else:
+        tag = "desc" if args.descriptor else "nodesc"
+        if args.no_constant_identity:
+            tag += "_noident"
 
     print(f"mode={args.mode} descriptor={args.descriptor!r} "
           f"cfg={args.cfg_value} steps={args.timesteps}\n")
@@ -98,7 +112,8 @@ def main() -> None:
             text = f"[{args.style}] {raw}" if args.style else raw
             clean, style = bv.parse_tags(text, eng.style_tags,
                                          eng.allow_inline_tags,
-                                         base_voice=args.descriptor)
+                                         max_styles=eng.max_style_tags,
+                                         base_voice=eng.voice_descriptor)
             t0 = time.monotonic()
             pcm = b"".join(bv.to_pcm16(o) for o in eng._generate(clean, style))
             gen = time.monotonic() - t0
